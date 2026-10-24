@@ -30,15 +30,28 @@ namespace {
 
 constexpr int kBlock = 16 * 1024;
 constexpr size_t kMaxPeers = 55;
-constexpr int kMaxConnecting = 16;
+constexpr size_t kBackgroundPeers = 25;  // a download nobody watches needs fewer connections
+// Socket memory is one pool for the whole app: peer sockets get small fixed buffers instead of growing
+// to 256 KB each, or a busy download left none for the app's own requests ("Couldn't connect").
+constexpr int kPeerRecvBuf = 64 * 1024, kPeerSendBuf = 32 * 1024;
+// Most peers trackers hand out are stale and never answer, so attempts must be many and short:
+// a live peer answers a SYN well under a second. Raise kMaxConnecting if the log shows a long queue.
+constexpr int kMaxConnecting = 30;
+constexpr uint64_t kConnectTimeoutMs = 4000;    // TCP connect / uTP SYN
+constexpr uint64_t kHandshakeTimeoutMs = 10000;  // connected, waiting for the BitTorrent handshake
+constexpr int kAnnounceThreads = 4;  // trackers asked at once (each blocks a socket session while waiting)
+constexpr int64_t kPrefetch = 8LL << 20;  // bytes fetched early around the resume point
 constexpr int kUploadSlots = 6;               // peers we upload to (tit-for-tat), plus one optimistic
 constexpr int64_t kLimitedUploadPerSec = 100 * 1024;
 constexpr size_t kPipeline = 32;                // outstanding block requests per peer
 constexpr int64_t kCacheBudget = 256LL << 20;   // RAM for downloaded + in-progress pieces
+constexpr int64_t kBackgroundBudget = 48LL << 20;  // the same for a download nobody watches (it is on the SD card)
 constexpr int64_t kReadAhead = 64LL << 20;      // high-priority window after the read head
 constexpr int64_t kInitialBuffer = 3LL << 20;   // start of file needed before playback starts
 constexpr int64_t kTailBuffer = 1LL << 20;      // end of file needed too (container index)
 constexpr uint64_t kBlockTimeoutMs = 12000;
+constexpr uint64_t kStallMs = 2000;  // a block playback waits on is asked from another peer after this
+constexpr int64_t kUrgent = 8LL << 20;  // bytes after the read position whose stalled blocks get asked twice
 
 const char* const kDefaultTrackers[] = {
     "udp://tracker.opentrackr.org:1337/announce",
@@ -122,7 +135,7 @@ std::vector<Endpoint> httpAnnounce(const std::string& url, const uint8_t* hash, 
     q += "info_hash=" + percentAll(hash, 20) + "&peer_id=" + percentAll(peerId, 20) +
          "&port=6881&uploaded=0&downloaded=0&left=1&compact=1&numwant=80&event=started";
     std::string body, err;
-    if (!httpGet(q, body, err, 15)) return {};
+    if (!httpGet(q, body, err, 15, true)) return {};
     BValue v;
     size_t pos = 0;
     if (!bdecode(body, pos, v)) return {};
@@ -267,6 +280,7 @@ struct Peer {
 struct PieceBuf {
     std::string data;
     std::vector<uint8_t> blocks;  // 0 missing, 1 requested, 2 received
+    std::vector<uint64_t> askedAt;  // when each block was last requested
     int received = 0;
 };
 
@@ -297,6 +311,9 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     uint64_t lastSidecar = 0;
     std::deque<std::pair<int, std::string>> writeQueue;  // verified pieces waiting to be written
 
+    std::atomic<int> announcing{0};  // tracker threads still running
+    double prefetchAt = -1;          // resume point as a fraction of the file, fetched early
+
     std::set<Endpoint> known;
     std::deque<Endpoint> candidates;
     std::map<Endpoint, int> attempts;
@@ -304,6 +321,10 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     uint64_t lastAnnounce = 0, lastMetaReq = 0, lastRechoke = 0, lastOptimistic = 0, lastDiag = 0;
     uint64_t lastDhtLookup = 0;
     int64_t uploaded = 0;
+    std::atomic<bool> yielding{false};  // see Torrent::yieldNetwork
+    std::atomic<bool> watched{true};    // see Torrent::setWatched
+    int64_t budget() const { return watched ? kCacheBudget : kBackgroundBudget; }
+    bool wasYielding = false;
     std::atomic<int> uploadMode{1};  // 0 off, 1 limited, 2 normal (Settings > Torrent uploading)
     uint64_t upWindowStart = 0;
     int64_t upWindowBytes = 0;
@@ -356,20 +377,29 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
 
     void announceAll() {
         lastAnnounce = nowMs();
+        if (announcing > 0) return;  // the last round is still going
+        auto urls = std::make_shared<std::vector<std::string>>();
+        for (auto& url : trackers)
+            if (url.compare(0, 6, "udp://") == 0 || url.compare(0, 4, "http") == 0) urls->push_back(url);
+        auto next = std::make_shared<std::atomic<size_t>>(0);
         auto self = shared_from_this();
-        for (auto& url : trackers) {
-            if (url.compare(0, 6, "udp://") != 0 && url.compare(0, 4, "http") != 0) continue;
-            startThread(
-                [self, url]() {
-                    if (self->stopping) return;
-                    std::vector<Endpoint> eps = url.compare(0, 6, "udp://") == 0
-                                                    ? udpAnnounce(url, self->infoHash, self->peerId)
-                                                    : httpAnnounce(url, self->infoHash, self->peerId);
-                    std::lock_guard<std::mutex> lock(self->m);
-                    if (!eps.empty()) logMsg("torrent: %s gave %zu peers", url.c_str(), eps.size());
-                    self->addPeers(eps);
+        for (int w = 0; w < kAnnounceThreads && w < (int)urls->size(); w++) {
+            announcing++;
+            bool ok = startThread(
+                [self, urls, next]() {
+                    for (size_t i; !self->stopping && (i = (*next)++) < urls->size();) {
+                        const std::string& url = (*urls)[i];
+                        std::vector<Endpoint> eps = url.compare(0, 6, "udp://") == 0
+                                                        ? udpAnnounce(url, self->infoHash, self->peerId)
+                                                        : httpAnnounce(url, self->infoHash, self->peerId);
+                        std::lock_guard<std::mutex> lock(self->m);
+                        if (!eps.empty()) logMsg("torrent: %s gave %zu peers", url.c_str(), eps.size());
+                        self->addPeers(eps);
+                    }
+                    self->announcing--;
                 },
                 256 * 1024);
+            if (!ok) announcing--;
         }
     }
 
@@ -381,8 +411,10 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     }
 
     void connectMore(uint64_t now) {
+        if (yielding) return;  // the app needs the network now: no new connections either
+        size_t maxPeers = watched ? kMaxPeers : kBackgroundPeers;
         int connecting = countState(0);
-        while (connecting < kMaxConnecting && peers.size() < kMaxPeers && !candidates.empty()) {
+        while (connecting < kMaxConnecting && peers.size() < maxPeers && !candidates.empty()) {
             Endpoint e = candidates.front();
             candidates.pop_front();
             if (attempts[e]++ >= 2) continue;
@@ -396,6 +428,8 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
             int fd = socket(AF_INET, SOCK_STREAM, 0);
             if (fd < 0) break;
             fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &kPeerRecvBuf, sizeof(kPeerRecvBuf));
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &kPeerSendBuf, sizeof(kPeerSendBuf));
             sockaddr_in a{};
             a.sin_family = AF_INET;
             a.sin_port = htons(e.port);
@@ -489,6 +523,10 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
             std::fill(metaGot.begin(), metaGot.end(), false);
             return;
         }
+        if (!saveDir.empty() && !fileExists(metaPath())) {
+            ensureDir(saveDir);
+            writeFile(metaPath(), metaBuf.data(), metaBuf.size());
+        }
         size_t pos = 0;
         BValue info;
         if (!bdecode(metaBuf, pos, info) || info.type != BValue::Dict) {
@@ -559,6 +597,9 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     }
 
     // ------------------------------------------------------------ SD card saving
+
+    // The info dict, kept next to the download so it can be opened again without asking peers.
+    std::string metaPath() const { return saveDir + "/" + hashHex + ".info"; }
 
     bool isSaved(int piece) const { return piece >= 0 && piece < (int)saved.size() && saved[piece]; }
 
@@ -676,14 +717,23 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
             len = fileLen;
         }
         std::string err;
-        FILE* f = fopen(path.c_str(), resumed ? "r+b" : "w+b");
+        // FAT32 caps files at 4 GB. A "concatenation file" is stored in parts by the system but read and
+        // written as one file by everyone (mpv included), on FAT32 and exFAT alike.
+        bool big = !resumed && len >= (4LL << 30);
+        if (big) {
+            remove(path.c_str());
+            FsFileSystem* fs = fsdevGetDeviceFileSystem("sdmc");
+            std::string fsPath = path.compare(0, 5, "sdmc:") == 0 ? path.substr(5) : path;
+            if (!fs || R_FAILED(fsFsCreateFile(fs, fsPath.c_str(), len, FsCreateOption_BigFile)))
+                err = "Can't create the file on the SD card";
+        }
+        FILE* f = err.empty() ? fopen(path.c_str(), resumed || big ? "r+b" : "w+b") : nullptr;
         if (!f) {
-            err = "Can't create the file on the SD card";
-        } else if (!resumed) {
+            if (err.empty()) err = "Can't create the file on the SD card";
+        } else if (!resumed && !big) {
             uint64_t t0 = nowMs();
             if (ftruncate(fileno(f), (off_t)len) != 0) {
-                err = len >= (4LL << 30) ? "Over 4 GB: the SD card must be exFAT to save this file"
-                                         : "Can't allocate the file on the SD card";
+                err = "Can't allocate the file on the SD card";
                 fclose(f);
                 f = nullptr;
                 remove(path.c_str());
@@ -797,7 +847,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     // ------------------------------------------------------------ pieces
 
     void evict(int64_t need) {
-        while (cacheBytes + activeBytes + need > kCacheBudget && !cache.empty()) {
+        while (cacheBytes + activeBytes + need > budget() && !cache.empty()) {
             int victim = -1;
             int64_t best = -1;
             for (auto& kv : cache) {
@@ -823,13 +873,14 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
         if (it != active.end()) return &it->second;
         int64_t sz = pieceSize(piece);
         bool urgent = piece == head || piece == head + 1;
-        if (cacheBytes + activeBytes + sz > kCacheBudget) {
+        if (cacheBytes + activeBytes + sz > budget()) {
             evict(sz);
-            if (!urgent && cacheBytes + activeBytes + sz > kCacheBudget) return nullptr;
+            if (!urgent && cacheBytes + activeBytes + sz > budget()) return nullptr;
         }
         PieceBuf& pb = active[piece];
         pb.data.assign((size_t)sz, '\0');
         pb.blocks.assign((size_t)((sz + kBlock - 1) / kBlock), 0);
+        pb.askedAt.assign(pb.blocks.size(), 0);
         activeBytes += sz;
         return &pb;
     }
@@ -844,18 +895,35 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
         for (int i = head; i <= std::min(end, head + 1); i++) order.push_back(i);
         for (int t = lastPiece; t >= std::max(firstPiece, lastPiece - 1); t--)
             if (t > head + 1) order.push_back(t);
-        for (int i = head + 2; i <= end; i++)
-            if (i < lastPiece - 1) order.push_back(i);
+        if (prefetchAt >= 0) {  // resuming: where the player will seek to, before it asks
+            int64_t at = fileOff + std::max<int64_t>(0, (int64_t)(prefetchAt * fileLen) - kPrefetch / 4);
+            int p0 = (int)(at / pieceLen), p1 = std::min(lastPiece, (int)((at + kPrefetch) / pieceLen));
+            if (head >= p0)
+                prefetchAt = -1;  // the player got there
+            else
+                for (int i = p0; i <= p1; i++) order.push_back(i);
+        }
+        bool windowDone = true;  // the next ~64 MB of playback are all here
+        for (int i = head + 2; i <= end; i++) {
+            if (i >= lastPiece - 1) continue;
+            order.push_back(i);
+            if (!cache.count(i) && !isSaved(i)) windowDone = false;
+        }
         if (firstPiece < head) order.push_back(firstPiece);  // container headers
-        int64_t budgetPieces = kCacheBudget / pieceLen;
+        // Beyond the window: while someone watches, new pieces there start only once the window is
+        // complete, so they never take bandwidth (or RAM) from what plays next. Pieces already started
+        // are finished, since they hold RAM. A download nobody watches takes everything.
+        auto beyond = [&](int i) { return windowDone || !watched || active.count(i); };
         if (saving || pendingAlloc) {  // downloading the whole file: everything after the window, then what's before it
             for (int i = end + 1; i < lastPiece - 1; i++)
-                if (!isSaved(i)) order.push_back(i);
+                if (!isSaved(i) && beyond(i)) order.push_back(i);
             for (int i = firstPiece; i < head; i++)
-                if (!isSaved(i)) order.push_back(i);
+                if (!isSaved(i) && beyond(i)) order.push_back(i);
             return;
         }
-        for (int i = end + 1; i < lastPiece - 1 && (i - head) < budgetPieces * 3 / 4; i++) order.push_back(i);
+        int64_t budgetPieces = budget() / pieceLen;
+        for (int i = end + 1; i < lastPiece - 1 && (i - head) < budgetPieces * 3 / 4; i++)
+            if (beyond(i)) order.push_back(i);
     }
 
     void sendRequest(Peer& p, int piece, int block, uint64_t now) {
@@ -870,11 +938,30 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     }
 
     void fillRequests(Peer& p, uint64_t now) {
+        // First what playback is blocked on (the next ~8 MB and the file tail): blocks another
+        // peer has sat on for a while are asked from this one too. This must come before the pipeline
+        // fills with the rest, or one slow peer holding the first blocks delays the start while the
+        // others download hundreds of MB further ahead.
+        int dup = 0, urgentEnd = head + std::max<int>(1, (int)(kUrgent / pieceLen));
+        for (size_t k = 0; k < order.size() && k < 64 && dup < 8; k++) {
+            bool urgent = (order[k] >= head && order[k] <= urgentEnd) || order[k] >= lastPiece - 1;
+            if (!urgent) continue;
+            auto it = active.find(order[k]);
+            if (it == active.end() || !p.has(order[k])) continue;
+            PieceBuf& pb = it->second;
+            for (int b = 0; b < (int)pb.blocks.size() && dup < 8 && p.reqs.size() < kPipeline; b++) {
+                if (pb.blocks[b] == 1 && now - pb.askedAt[b] > kStallMs && !p.requested(order[k], b)) {
+                    sendRequest(p, order[k], b, now);
+                    pb.askedAt[b] = now;
+                    dup++;
+                }
+            }
+        }
         for (int piece : order) {
             if (p.reqs.size() >= kPipeline) return;
             if (cache.count(piece) || isSaved(piece) || !p.has(piece)) continue;
             PieceBuf* pb = getActive(piece);
-            if (!pb) continue;
+            if (!pb) break;  // RAM budget full: the later (less urgent) pieces would not fit either
             // The file's last piece is fetched back to front: its final bytes matter first.
             bool backwards = piece == lastPiece && piece != head;
             int nb = (int)pb->blocks.size();
@@ -882,20 +969,8 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                 int b = backwards ? nb - 1 - k : k;
                 if (pb->blocks[b] != 0) continue;
                 pb->blocks[b] = 1;
+                pb->askedAt[b] = now;
                 sendRequest(p, piece, b, now);
-            }
-        }
-        // End game for the pieces the player is waiting on: ask for blocks other peers are slow on.
-        int dup = 0;
-        // (the head, the next piece and the file tail: what playback is blocked on)
-        for (size_t k = 0; k < order.size() && k < 4 && p.reqs.size() < kPipeline; k++) {
-            auto it = active.find(order[k]);
-            if (it == active.end() || !p.has(order[k])) continue;
-            for (int b = 0; b < (int)it->second.blocks.size() && dup < 8; b++) {
-                if (it->second.blocks[b] == 1 && !p.requested(order[k], b)) {
-                    sendRequest(p, order[k], b, now);
-                    dup++;
-                }
             }
         }
     }
@@ -1252,7 +1327,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                     o.tries++;
                 }
             }
-            if (!u.connected && now - p.since > 7000) p.dead = true;
+            if (!u.connected && now - p.since > kConnectTimeoutMs) p.dead = true;
         }
     }
 
@@ -1459,6 +1534,13 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     // ------------------------------------------------------------ engine loop
 
     void run() {
+        {  // Saved before: start from the SD card right away, peers only fill in what is missing.
+            std::lock_guard<std::mutex> lock(m);
+            if (!saveDir.empty() && readFile(metaPath(), metaBuf)) {
+                logMsg("torrent: metadata loaded from the SD card");
+                finishMetadata();
+            }
+        }
         announceAll();
         dhtStart();
         std::vector<char> buf(64 * 1024);
@@ -1511,7 +1593,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
             if (dhtIdx >= 0 && (fds[dhtIdx].revents & POLLIN)) dhtReceive(buf);
             for (auto& p : peers) {  // uTP peers: the same timeouts as TCP ones
                 if (!p.utp || p.dead) continue;
-                if (p.state == 1 && now - p.since > 20000) p.dead = true;
+                if (p.state == 1 && now - p.since > kHandshakeTimeoutMs) p.dead = true;
                 if (p.state == 2 && haveMeta && p.choked && now - p.chokedSince > 60000 && !candidates.empty() &&
                     peers.size() >= kMaxPeers - 5)
                     p.dead = true;
@@ -1533,7 +1615,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                         p.state = 1;
                         p.since = p.lastRecv = now;
                         sendHandshake(p);
-                    } else if (now - p.since > 7000) {
+                    } else if (now - p.since > kConnectTimeoutMs) {
                         p.dead = true;
                     }
                     continue;
@@ -1554,7 +1636,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                 } else if (re & (POLLERR | POLLHUP | POLLNVAL)) {
                     p.dead = true;
                 }
-                if (p.state == 1 && now - p.since > 20000) p.dead = true;
+                if (p.state == 1 && now - p.since > kHandshakeTimeoutMs) p.dead = true;
                 // Make room for new peers: drop ones that kept us choked for a minute.
                 if (p.state == 2 && haveMeta && p.choked && now - p.chokedSince > 60000 && !candidates.empty() &&
                     peers.size() >= kMaxPeers - 5)
@@ -1592,7 +1674,22 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                        known.size(), candidates.size(), dhtNodes.size(), dhtPeersFound,
                        (long long)(activeBytes >> 20), (long long)(cacheBytes >> 20), head);
             }
+            if (!watched) evict(0);  // just became a background download: give the RAM back now
             buildOrder();
+            if (yielding && !wasYielding)  // give the connection back now: cancel what is in flight
+                for (auto& p : peers) {
+                    if (p.dead || p.state != 2) continue;
+                    for (auto& r : p.reqs) {
+                        int64_t begin = (int64_t)r.block * kBlock;
+                        std::string pl;
+                        put32(pl, (uint32_t)r.piece);
+                        put32(pl, (uint32_t)begin);
+                        put32(pl, (uint32_t)std::min<int64_t>(kBlock, pieceSize(r.piece) - begin));
+                        sendMsg(p, 8, pl);
+                    }
+                    releaseRequests(p);
+                }
+            wasYielding = yielding;
             for (auto& p : peers) {
                 if (p.dead || p.state != 2 || !haveMeta) continue;
                 if (!p.interestedSent) {
@@ -1600,7 +1697,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                     p.interestedSent = true;
                 }
                 expireRequests(p, now);
-                if (!p.choked) fillRequests(p, now);
+                if (!p.choked && !yielding) fillRequests(p, now);
             }
 
             for (auto it = peers.begin(); it != peers.end();) {
@@ -1687,6 +1784,10 @@ void Torrent::start() {
     logMsg("torrent: starting %s with %zu trackers", d->hashHex.c_str(), d->trackers.size());
     auto self = d;
     startThread([self]() { self->run(); }, 512 * 1024);
+}
+
+bool Torrent::stopped() const {
+    return d->stopping;
 }
 
 void Torrent::stop() {
@@ -1798,6 +1899,19 @@ int64_t Torrent::read(int64_t off, char* buf, int64_t n, const std::atomic<bool>
         if (d->stopping || cancel) return -1;
         d->cv.wait_for(lock, std::chrono::milliseconds(250));
     }
+}
+
+void Torrent::setWatched(bool on) {
+    d->watched = on;
+}
+
+void Torrent::yieldNetwork(bool on) {
+    d->yielding = on;
+}
+
+void Torrent::prefetch(double fraction) {
+    std::lock_guard<std::mutex> lock(d->m);
+    d->prefetchAt = fraction;
 }
 
 void Torrent::wakeUp() {

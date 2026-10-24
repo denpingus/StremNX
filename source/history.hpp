@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,22 +41,26 @@ public:
     void save() const;
 
     void record(const PlayContext& ctx, double position, double duration);
+    // Takes a title out of Continue Watching and Recently Watched for good, on this Switch: the account
+    // sync doesn't bring it back unless it is watched again (here or on another device).
+    void removeTitle(const std::string& metaId);
     void mergeAccount(const std::vector<HistoryEntry>& items);
 
     const HistoryEntry* findVideo(const std::string& videoId) const;
+    // Where to resume this video: by its id or, failing that, by the file (a title can have another
+    // id in another addon's catalog). Null when it was not started or is finished.
+    const HistoryEntry* resumePoint(const PlayContext& ctx) const;
     const HistoryEntry* latestForMeta(const std::string& metaId) const;
 
     // One entry per title, newest first, not finished.
     std::vector<HistoryEntry> continueWatching(size_t max = 20) const;
     // One entry per title, newest first.
     std::vector<HistoryEntry> recentTitles(size_t max) const;
-    // Most watched genres for a type, weighted toward recent titles.
-    std::vector<std::string> topGenres(const std::string& type, size_t max) const;
-    std::vector<std::string> metaIds() const;
     bool empty() const { return entries.empty(); }
 
 private:
     std::vector<HistoryEntry> entries;
+    std::map<std::string, int64_t> removed;  // metaId -> when it was removed
 };
 
 int64_t parseIsoTime(const std::string& iso);

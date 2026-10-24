@@ -22,12 +22,18 @@ public:
     void start(F fn) {
         auto s = std::make_shared<State>();
         st = s;
-        startThread([s, fn]() mutable {
+        bool ok = startThread([s, fn]() mutable {
             T v = fn();
             std::lock_guard<std::mutex> lock(s->m);
             s->value = std::move(v);
             s->done = true;
         });
+        if (!ok) {  // no thread could be made (memory is tight): do the work here rather than never finishing
+            T v = fn();
+            std::lock_guard<std::mutex> lock(s->m);
+            s->value = std::move(v);
+            s->done = true;
+        }
     }
 
     // Started and not yet consumed with take().

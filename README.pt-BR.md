@@ -40,7 +40,6 @@ Ele não é uma recompilação do app oficial: reimplementa o protocolo de addon
 
 - **Início no estilo Netflix/Prime:** destaque rotativo no topo (fundo, logo, sinopse, botões Play e More Info) e fileiras horizontais
 - **Continue Watching:** retoma de onde você parou, com barra de progresso; sincroniza com o progresso da sua conta Stremio
-- **Recomendações:** "Because you watched…" e "Top Picks for You", com base nos gêneros que você mais assiste
 - Abas **Movies** e **Series** com fileiras por catálogo e por gênero, **Search** com resultados em fileiras e **Account**
 - Detalhes com logo do título, nota do IMDb, elenco, botões Resume/Start Over, temporadas e episódios com miniatura e progresso
 - Lista de streams com selos de qualidade (4K, 1080p, HDR/Dolby Vision), tamanho, seeders e tipo (Torrent, Debrid, Direct)

@@ -34,6 +34,9 @@ std::string normalizeAddonUrl(const std::string& url) {
     std::string u = url;
     while (!u.empty() && (u.back() == ' ' || u.back() == '/')) u.pop_back();
     if (u.compare(0, 10, "stremio://") == 0) u = "https://" + u.substr(10);
+    // The link on an addon's page is often its configure page: the manifest sits next to it.
+    if (endsWith(u, "/configure/manifest.json")) u.resize(u.size() - strlen("/configure/manifest.json"));
+    if (endsWith(u, "/configure")) u.resize(u.size() - strlen("/configure"));
     if (!endsWith(u, "/manifest.json")) u += "/manifest.json";
     return u;
 }
@@ -144,6 +147,7 @@ static MetaItem parseMetaItem(const Json& j) {
     m.imdbRating = j["imdbRating"].str();
     m.releaseInfo = j["releaseInfo"].str(j["year"].str());
     m.genres = genreList(j);
+    m.posterShape = j["posterShape"].str();
     return m;
 }
 

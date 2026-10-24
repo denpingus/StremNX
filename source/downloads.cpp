@@ -1,6 +1,7 @@
 #include "downloads.hpp"
 
 #include <dirent.h>
+#include <strings.h>
 #include <switch.h>
 
 #include <algorithm>
@@ -47,10 +48,20 @@ std::vector<DownloadInfo> listDownloads() {
     return out;
 }
 
+bool findSavedDownload(const std::string& infoHash, int fileIdx, DownloadInfo& out) {
+    for (auto& d : listDownloads())
+        if (d.fileIdx == fileIdx && strcasecmp(d.infoHash.c_str(), infoHash.c_str()) == 0) {
+            out = d;
+            return true;
+        }
+    return false;
+}
+
 bool deleteDownload(const DownloadInfo& d) {
     bool ok = true;
     if (!d.file.empty() && fileExists(d.file)) ok = remove(d.file.c_str()) == 0;
     if (remove(d.sidecar.c_str()) != 0) ok = false;
+    remove((std::string(DOWNLOADS_DIR "/") + d.infoHash + ".info").c_str());  // saved torrent metadata
     logMsg("downloads: deleted %s (%s)", d.fileName.c_str(), ok ? "ok" : "failed");
     return ok;
 }

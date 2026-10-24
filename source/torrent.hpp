@@ -33,12 +33,19 @@ public:
 
     void start();
     void stop();
+    bool stopped() const;
     // Waits for the engine thread to close its files after stop().
     bool waitStopped(int timeoutMs);
     // After sleep: connections are dead, so forget failed attempts and ask for peers again.
     void wakeUp();
     // 0: never upload, 1: limited (~100 KB/s, 2 peers), 2: normal (6 peers, no limit).
     void setUploadMode(int mode);
+    // While on, no new pieces are requested (those in flight still arrive): leaves the connection to
+    // what the viewer is waiting for, like artwork, when this is a background download.
+    void yieldNetwork(bool on);
+    // Off for a background download: it keeps a small RAM cache (the pieces are on the SD card), so
+    // several downloads don't hold 256 MB each.
+    void setWatched(bool on);
 
     // Call before start(): saves the selected file into `dir` and downloads all of it, resuming a
     // previous partial download. `infoJson` (title, artwork...) is stored in the progress file.
@@ -52,6 +59,9 @@ public:
     bool hasMetadata();
     int64_t fileSize();
     std::string fileName();
+
+    // Fetches the part at `fraction` of the file early (the resume point, before the player seeks there).
+    void prefetch(double fraction);
 
     // True once the start and the end of the file are downloaded. pct = progress toward that.
     bool initialBufferReady(int* pct, bool* startReady = nullptr);

@@ -115,6 +115,7 @@ void Gfx::makeGradients() {
 
 bool Gfx::restoreRenderer() {
     SDL_GL_ResetAttributes();
+    requestColorDepth();
     r = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!r) {
         logMsg("SDL_CreateRenderer failed: %s", SDL_GetError());
@@ -122,6 +123,12 @@ bool Gfx::restoreRenderer() {
     }
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+    disableGlDither();  // the renderer's GL context is current now
+    int rb = 0, gb = 0, bb = 0;
+    SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &rb);
+    SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &gb);
+    SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &bb);
+    logMsg("ui: framebuffer %d/%d/%d bits", rb, gb, bb);
     makeGradients();
     return true;
 }
@@ -176,7 +183,7 @@ void Gfx::pumpImages() {
         pending.erase(url);
         if (dropped) continue;
         if (!surf) {
-            failed.insert(url);
+            failed[url] = SDL_GetTicks();
             continue;
         }
         SDL_Texture* t = r ? SDL_CreateTextureFromSurface(r, surf) : nullptr;
@@ -422,12 +429,18 @@ SDL_Texture* Gfx::image(const std::string& url, Uint8* fade) {
         if (fade) *fade = (Uint8)std::min<uint64_t>(255, (frame - it->second.born) * 255 / kFadeFrames);
         return it->second.tex;
     }
+    // A failed image is tried again after a while: most failures are a busy network (a torrent
+    // downloading), and a poster that failed once must not stay blank for good.
+    auto f = failed.find(url);
+    if (f != failed.end()) {
+        if (SDL_GetTicks() - f->second < 10000) return nullptr;
+        failed.erase(f);
+    }
     if (url.compare(0, 6, "romfs:") == 0) {
-        if (failed.count(url)) return nullptr;
         SDL_Surface* s = IMG_Load(url.c_str());
         SDL_Texture* t = s ? SDL_CreateTextureFromSurface(r, s) : nullptr;
         if (!t) {
-            failed.insert(url);
+            failed[url] = SDL_GetTicks();
             if (s) SDL_FreeSurface(s);
             return nullptr;
         }
@@ -436,7 +449,7 @@ SDL_Texture* Gfx::image(const std::string& url, Uint8* fade) {
         if (fade) *fade = 255;
         return t;
     }
-    if (!pending.count(url) && !failed.count(url)) {
+    if (!pending.count(url)) {
         pending.insert(url);
         loader.request(url);
     }

@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <map>
 #include <set>
 
 #include "json.hpp"
@@ -23,6 +22,8 @@ void History::load() {
         return;
     }
     entries.clear();
+    removed.clear();
+    for (auto& r : j["removed"].items()) removed[r["metaId"].str()] = (int64_t)r["at"].num();
     for (auto& e : j["entries"].items()) {
         HistoryEntry h;
         h.metaId = e["metaId"].str();
@@ -73,14 +74,21 @@ void History::save() const {
         e.set("position", h.position).set("duration", h.duration).set("updated", (double)h.updated);
         arr.push(e);
     }
+    Json gone = Json::array();
+    for (auto& kv : removed) {
+        Json r = Json::object();
+        r.set("metaId", kv.first).set("at", (double)kv.second);
+        gone.push(r);
+    }
     Json j = Json::object();
-    j.set("entries", arr);
+    j.set("entries", arr).set("removed", gone);
     std::string text = j.dump();
     if (!writeFile(kHistoryPath, text.data(), text.size())) logMsg("failed to save history");
 }
 
 void History::record(const PlayContext& ctx, double position, double duration) {
     if (ctx.metaId.empty() || ctx.videoId.empty() || duration <= 0) return;
+    removed.erase(ctx.metaId);  // watched again: it belongs in the lists again
     HistoryEntry h;
     static_cast<PlayContext&>(h) = ctx;
     h.position = position;
@@ -96,6 +104,8 @@ void History::record(const PlayContext& ctx, double position, double duration) {
 
 void History::mergeAccount(const std::vector<HistoryEntry>& items) {
     for (auto& a : items) {
+        auto gone = removed.find(a.metaId);
+        if (gone != removed.end() && a.updated <= gone->second) continue;  // removed by hand, not watched since
         auto it = std::find_if(entries.begin(), entries.end(),
                                [&](const HistoryEntry& e) { return e.videoId == a.videoId; });
         if (it == entries.end()) {
@@ -111,10 +121,27 @@ void History::mergeAccount(const std::vector<HistoryEntry>& items) {
     if (entries.size() > kMaxEntries) entries.resize(kMaxEntries);
 }
 
+void History::removeTitle(const std::string& metaId) {
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const HistoryEntry& e) { return e.metaId == metaId; }),
+                  entries.end());
+    removed[metaId] = (int64_t)time(nullptr);
+    save();
+}
+
 const HistoryEntry* History::findVideo(const std::string& videoId) const {
     for (auto& e : entries)
         if (e.videoId == videoId) return &e;
     return nullptr;
+}
+
+const HistoryEntry* History::resumePoint(const PlayContext& ctx) const {
+    const HistoryEntry* h = findVideo(ctx.videoId);
+    const SavedStream& s = ctx.stream;
+    for (size_t i = 0; !h && s.valid() && i < entries.size(); i++) {
+        const SavedStream& e = entries[i].stream;
+        if (!s.url.empty() ? e.url == s.url : e.infoHash == s.infoHash && e.fileIdx == s.fileIdx) h = &entries[i];
+    }
+    return h && h->position > 30 && !h->finished() ? h : nullptr;
 }
 
 const HistoryEntry* History::latestForMeta(const std::string& metaId) const {
@@ -140,30 +167,6 @@ std::vector<HistoryEntry> History::continueWatching(size_t max) const {
         if (out.size() >= max) break;
         if (!e.finished() && e.position > 10) out.push_back(e);
     }
-    return out;
-}
-
-std::vector<std::string> History::topGenres(const std::string& type, size_t max) const {
-    std::map<std::string, double> score;
-    double weight = 1.0;
-    for (auto& e : recentTitles(30)) {
-        if (!type.empty() && e.type != type) continue;
-        for (auto& g : e.genres) score[g] += weight;
-        weight *= 0.85;  // older titles count less
-    }
-    std::vector<std::pair<double, std::string>> v;
-    for (auto& kv : score) v.emplace_back(kv.second, kv.first);
-    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
-    std::vector<std::string> out;
-    for (size_t i = 0; i < v.size() && i < max; i++) out.push_back(v[i].second);
-    return out;
-}
-
-std::vector<std::string> History::metaIds() const {
-    std::vector<std::string> out;
-    std::set<std::string> seen;
-    for (auto& e : entries)
-        if (seen.insert(e.metaId).second) out.push_back(e.metaId);
     return out;
 }
 

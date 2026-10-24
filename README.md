@@ -17,7 +17,6 @@
 
 - **Streaming-service style home**: rotating hero banner, horizontal rows, *Continue Watching*, *My List* and
   *Recently Watched*
-- **Recommendations** ("Because you watched…", "Top Picks for You") based on the genres you watch
 - **Discover** tab with type / catalog / genre filters, plus Movies, Series and Search tabs
 - **Stremio account**: log in, use the addons installed on your account, sync your watch progress and library
 - **Details page** with title logo, IMDb rating, cast, seasons and episodes with thumbnails and progress

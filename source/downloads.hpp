@@ -21,6 +21,8 @@ struct DownloadInfo {
 };
 
 std::vector<DownloadInfo> listDownloads();  // newest first
+// The SD card download (finished or not) of this torrent file, if there is one.
+bool findSavedDownload(const std::string& infoHash, int fileIdx, DownloadInfo& out);
 bool deleteDownload(const DownloadInfo& d);
 int64_t sdFreeSpace();
 // Progress-file JSON describing what is being saved, for the Downloads screen.

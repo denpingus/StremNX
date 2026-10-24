@@ -88,7 +88,7 @@ class DetailScreen : public Screen {
         return v.season > 0 ? "S" + std::to_string(v.season) + ":E" + std::to_string(v.episode) : v.title;
     }
 
-    enum { ActPlay, ActStartOver, ActOtherStreams, ActLibrary };
+    enum { ActPlay, ActStartOver, ActLibrary };
 
     void buildButtons(App& app) {
         buttons.clear();
@@ -129,33 +129,25 @@ class DetailScreen : public Screen {
                         if (eps[k] == target) epSel = k;
                 }
         }
-        const HistoryEntry* hv = app.history.findVideo(target < 0 ? meta.id : meta.videos[target].id);
-        bool saved = resume && hv && hv->stream.valid() && app.cfg.resumeSavedStream;
         buttons.push_back({label, IconPlay, true, ActPlay, target});
-        if (saved) buttons.push_back({"Other streams", IconList, false, ActOtherStreams, target});
         if (resume) buttons.push_back({"Start Over", IconRestart, false, ActStartOver, target});
         bool inLib = app.library.contains(meta.id);
         buttons.push_back({inLib ? "In My List" : "My List", inLib ? IconCheck : IconAdd, false, ActLibrary, target});
     }
 
-    // useSaved: go straight to the stream picked last time for this video, if there is one.
-    void play(App& app, int video, bool resume, bool useSaved) {
+    // Always through the stream list, so another stream can be picked (Continue Watching on the home
+    // screen is the shortcut straight back to the same one).
+    void play(App& app, int video, bool resume) {
         PlayContext ctx = video < 0 ? contextFor() : contextForEpisode(meta, meta.videos[video]);
         const HistoryEntry* h = app.history.findVideo(ctx.videoId);
-        if (h && h->stream.valid()) ctx.stream = h->stream;  // marked "Last used" in the list
-        if (useSaved && resume && app.cfg.resumeSavedStream && ctx.stream.valid()) {
-            ctx.fromSaved = true;
-            playStream(app, streamFromSaved(ctx.stream), ctx, true, false);
-            return;
-        }
+        if (h && h->stream.valid()) ctx.stream = h->stream;  // marked "Last used", on top of the list
         app.push(makeStreamsScreen(ctx, resume));
     }
 
     void runButton(App& app, const Btn& b) {
         switch (b.action) {
-            case ActPlay: play(app, b.video, true, true); break;
-            case ActStartOver: play(app, b.video, false, false); break;
-            case ActOtherStreams: play(app, b.video, true, false); break;
+            case ActPlay: play(app, b.video, true); break;
+            case ActStartOver: play(app, b.video, false); break;
             case ActLibrary: {
                 bool in = !app.library.contains(meta.id);
                 MetaItem m = item;
@@ -256,7 +248,7 @@ public:
             }
             if (tid == 62 && ta < (int)eps.size()) {
                 focus = FocusEpisodes;
-                if (epSel == ta) play(app, eps[ta], true, true);
+                if (epSel == ta) play(app, eps[ta], true);
                 epSel = ta;
                 return;
             }
@@ -283,8 +275,7 @@ public:
             case FocusEpisodes:
                 if (in.pressed(K_RIGHT) && epSel + 1 < (int)eps.size()) epSel++;
                 if (in.pressed(K_LEFT) && epSel > 0) epSel--;
-                if (in.pressed(K_A) && !eps.empty()) play(app, eps[epSel], true, true);
-                if (in.pressed(K_X) && !eps.empty()) play(app, eps[epSel], true, false);  // pick another stream
+                if (in.pressed(K_A) && !eps.empty()) play(app, eps[epSel], true);
                 break;
         }
     }
@@ -352,7 +343,7 @@ public:
 
         if (series) drawEpisodes(app);
         drawBackButton(app);
-        app.drawFooter(series ? (focus == FocusEpisodes ? "A Play   X Other stream   L/R Season   B Back" : "A Select   L/R Season   B Back")
+        app.drawFooter(series ? (focus == FocusEpisodes ? "A Play   L/R Season   B Back" : "A Select   L/R Season   B Back")
                               : "A Select   B Back");
     }
 

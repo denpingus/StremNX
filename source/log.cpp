@@ -13,6 +13,7 @@ void logOpen(const char* path) {
 }
 
 void logClose() {
+    std::lock_guard<std::mutex> lock(g_logMutex);  // other threads may be logging right now
     if (g_log) fclose(g_log);
     g_log = nullptr;
 }

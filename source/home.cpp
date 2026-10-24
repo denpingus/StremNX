@@ -16,7 +16,7 @@ namespace {
 
 constexpr int kMarginX = 60;
 constexpr int kGap = 16;
-constexpr int kHeroRowsTop = 470;  // where rows start below the hero (content coordinates)
+constexpr int kHeroRowsTop = 500;  // where rows start below the hero (content coordinates)
 constexpr uint32_t kHeroInterval = 9000;
 constexpr uint32_t kHeroFadeMs = 700;
 constexpr size_t kRowLimit = 40;
@@ -24,28 +24,35 @@ constexpr size_t kRowLimit = 40;
 struct Card {
     MetaItem item;
     bool isContinue = false;
+    bool fromHistory = false;  // Continue Watching / Recently Watched: can be removed
     HistoryEntry entry;
 };
 
 struct Row {
+    std::string key;  // its Settings > Home sections key (home screen rows)
     std::string title;
-    bool landscape = false;
+    bool landscape = false;  // Continue Watching: backdrop cards with the title on them
+    // The catalog's own artwork shape: the addon's posterShape or, when it doesn't say, the first image.
+    enum Shape { Tall, Wide, Square } shape = Tall;
+    bool shapeKnown = false;
     bool feedsHero = false;
     std::vector<Card> cards;
     std::function<CatalogResult()> loader;
     Task<CatalogResult> task;
     bool started = false, loaded = false;
+    int retries = 0;  // a failed fetch (network busy, addon down) is tried again a few times
+    uint32_t retryAt = 0;
     int sel = 0;
     float scrollX = 0;
 
-    int cardW() const { return landscape ? 300 : 158; }
-    int cardH() const { return landscape ? 169 : 237; }
+    int cardW() const { return landscape || shape == Wide ? 300 : shape == Square ? 210 : 158; }
+    int cardH() const { return landscape || shape == Wide ? 169 : shape == Square ? 210 : 237; }
     bool hidden() const { return loaded && cards.empty(); }
     int height() const { return hidden() ? 0 : 44 + cardH() + (landscape ? 66 : 60); }
 };
 
 struct PageAction {
-    enum Kind { None, Details, Play, Resume, OtherStreams } kind = None;
+    enum Kind { None, Details, Play, Resume, OtherStreams, Remove } kind = None;
     MetaItem item;
     HistoryEntry entry;
 };
@@ -105,6 +112,10 @@ public:
         heroBuilt = false;
         heroIdx = 0;
         heroPrev = -1;
+        toTop();
+    }
+
+    void toTop() {
         focus = hasHero ? 0 : 1;
         heroBtn = 0;
         scrollY = 0;
@@ -118,17 +129,33 @@ public:
 
     PageAction update(App& app) {
         PageAction act;
-        int focusRow = std::max(0, focus - 1);
+        int focusRow = std::max(0, focus - 1), fixedRows = 0;  // rows with nothing to fetch
+        for (auto& r : rows) fixedRows += !r.loader;
         for (size_t i = 0; i < rows.size(); i++) {
             Row& r = rows[i];
-            if (!r.started && r.loader && (int)i <= focusRow + 3) {
+            // Rows load as they come near (rows with nothing to fetch do not count); the ones the hero
+            // is built from always load.
+            if (!r.started && r.loader && SDL_GetTicks() >= r.retryAt &&
+                ((int)i <= focusRow + 3 + fixedRows || r.feedsHero)) {
                 r.started = true;
                 auto ld = r.loader;
                 r.task.start([ld]() { return ld(); });
             }
             if (r.task.ready()) {
                 CatalogResult res = r.task.take();
+                if (res.items.empty() && !res.err.empty() && r.retries < 4) {  // again in 3, 6, 12, 24 s
+                    logMsg("home: %s failed (%s), retrying", r.title.c_str(), res.err.c_str());
+                    r.started = false;
+                    r.retryAt = SDL_GetTicks() + (3000u << r.retries++);
+                    continue;
+                }
                 for (auto& it : res.items) r.cards.push_back(Card{it});
+                for (auto& it : res.items) {
+                    if (it.posterShape.empty()) continue;
+                    r.shape = it.posterShape == "landscape" ? Row::Wide : it.posterShape == "square" ? Row::Square : Row::Tall;
+                    r.shapeKnown = true;
+                    break;
+                }
                 r.loaded = true;
             }
         }
@@ -146,7 +173,7 @@ public:
 
         // Touch: tapping a card selects it; tapping the selected card (or a hero button) opens it.
         int tid = 0, ta = 0, tb = 0;
-        bool tapOpen = false;
+        bool tapOpen = false, tapRemove = false;
         if (app.tapped(tid, ta, tb)) {
             if (tid == 10 && hasHero) {
                 focus = 0;
@@ -154,6 +181,10 @@ public:
                 tapOpen = true;
             } else if (tid == 11 && ta < (int)rows.size() && tb < (int)rows[ta].cards.size()) {
                 tapOpen = focus == ta + 1 && rows[ta].sel == tb;
+                focus = ta + 1;
+                rows[ta].sel = tb;
+            } else if (tid == 12 && ta < (int)rows.size() && tb < (int)rows[ta].cards.size()) {
+                tapRemove = true;  // the X on a history card
                 focus = ta + 1;
                 rows[ta].sel = tb;
             }
@@ -184,7 +215,16 @@ public:
             act.kind = PageAction::Details;
         else if (in.pressed(K_X) && c.isContinue)
             act.kind = PageAction::OtherStreams;
+        else if ((in.pressed(K_MINUS) || tapRemove) && c.fromHistory)
+            act.kind = PageAction::Remove;
         return act;
+    }
+
+    // The focused card is in Continue Watching / Recently Watched (for the footer hint).
+    bool historyFocused() const {
+        if (focus < 1 || focus > (int)rows.size()) return false;
+        const Row& r = rows[focus - 1];
+        return !r.cards.empty() && r.cards[std::min(r.sel, (int)r.cards.size() - 1)].fromHistory;
     }
 
     void draw(App& app) {
@@ -313,6 +353,15 @@ private:
         float maxX = (float)std::max(0, n * step - kGap - (W - 2 * kMarginX));
         r.scrollX = approach(r.scrollX, std::min(target, maxX), 0.25f);
 
+        if (!r.shapeKnown && !r.landscape && n > 0) {  // the addon didn't say: go by the first image
+            if (SDL_Texture* t = g.image(r.cards[0].item.poster)) {
+                int tw = 0, th = 0;
+                SDL_QueryTexture(t, nullptr, nullptr, &tw, &th);
+                if (tw > th * 1.2f) r.shape = Row::Wide;
+                else if (std::abs(tw - th) < tw / 10) r.shape = Row::Square;
+                r.shapeKnown = true;
+            }
+        }
         if (n == 0 && !r.loaded) {  // skeleton cards while loading
             Uint8 pulse = (Uint8)(40 + 25 * std::sin(SDL_GetTicks() / 250.0));
             for (int i = 0; i * step < W; i++) g.roundRect(kMarginX + i * step, cy, cw, ch, 6, col::card.alpha(pulse + 120));
@@ -327,6 +376,12 @@ private:
             else
                 drawPoster(g, r.cards[i], x, cy, cw, ch, sel);
             app.hit(x, cy, cw, ch, 11, rowIdx, i);
+            if (sel && r.cards[i].fromHistory) {  // × to remove it (touch / pointer; - on the controller)
+                int bx = x + cw - 22, by = cy + 4;
+                g.text("\xC3\x97", bx + 1, by + 1, 30, col::black.alpha(150), 0, AlignCenter);  // soft shadow
+                g.text("\xC3\x97", bx, by, 30, col::white, 0, AlignCenter);
+                app.hit(bx - 22, by - 6, 44, 44, 12, rowIdx, i);
+            }
         }
     }
 
@@ -343,9 +398,16 @@ public:
         Uint8 fade = 0;
         SDL_Texture* t = g.image(c.item.poster, &fade);
         g.rect(x, y, w, h, col::card);
-        if (t)
-            g.drawTex(t, x, y, w, h, fade);
-        else
+        int tw = 0, th = 0;
+        if (t) SDL_QueryTexture(t, nullptr, nullptr, &tw, &th);
+        if (t && tw > 0 && th > 0) {
+            float s = std::min((float)w / tw, (float)h / th);
+            int dw = (int)(tw * s), dh = (int)(th * s);
+            if (std::abs(dw - w) < w / 8 && std::abs(dh - h) < h / 8)
+                g.drawTex(t, x, y, w, h, fade);  // the card's shape: fill it
+            else
+                g.drawTex(t, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh, fade);  // another shape: whole, never squashed
+        } else
             g.textWrapped(c.item.name, x + 12, y + 14, 19, col::dim, w - 24, h - 28);
         if (c.entry.duration > 0) {  // from the watch history
             if (c.entry.finished()) {
@@ -421,53 +483,73 @@ CatalogPick genreCatalog(const std::vector<Addon>& addons, const std::string& ty
 }
 
 std::string typeLabel(const std::string& type) {
-    return type == "series" ? "Series" : "Movies";
+    if (type == "movie") return "Movies";
+    if (type == "series") return "Series";
+    if (type == "tv") return "TV";
+    std::string t = type;  // anime, channel, other...: the addon's own word
+    if (!t.empty()) t[0] = (char)toupper((unsigned char)t[0]);
+    return t;
 }
 
-void addRecommendations(App& app, BrowsePage& p, const std::string& onlyType) {
-    std::set<std::string> watched;
-    for (auto& id : app.history.metaIds()) watched.insert(id);
+// Every type the addons publish catalogs for: movies and series first, then the rest in addon order.
+std::vector<std::string> catalogTypes(const std::vector<Addon>& addons) {
+    std::vector<std::string> types = {"movie", "series"};
+    for (auto& c : listCatalogs(addons))
+        if (std::find(types.begin(), types.end(), c.type) == types.end()) types.push_back(c.type);
+    return types;
+}
 
-    // "Because you watched X" for the latest two titles
-    int added = 0;
-    std::set<std::string> usedGenres;
-    for (auto& e : app.history.recentTitles(6)) {
-        if (added >= 2) break;
-        if (!onlyType.empty() && e.type != onlyType) continue;
-        for (auto& gname : e.genres) {
-            if (usedGenres.count(gname)) continue;
-            CatalogPick pick = genreCatalog(app.addons, e.type, gname);
-            if (!pick) continue;
-            Row r;
-            r.title = "Because you watched " + e.name;
-            r.loader = catalogLoader(*pick.addon, pick.info, "genre=" + urlEncode(gname), watched);
-            p.rows.push_back(std::move(r));
-            usedGenres.insert(gname);
-            added++;
-            break;
+struct HomeSection {
+    std::string key, title, type, addonName;
+    CatalogPick pick;  // points into App::addons: use it right away, not after a reload
+    bool on = true;
+    bool fixed = false;  // Continue Watching, My List, Recently Watched: built from local data
+};
+
+// The home screen's rows: Continue Watching, My List and Recently Watched, then every catalog the
+// addons offer, in the order picked in Settings > Home sections. Ones not placed yet keep the default
+// order (those three, the first movie and series catalogs, usually "Popular", then the rest by type).
+// Switched-off ones come back with on = false.
+std::vector<HomeSection> homeSections(App& app) {
+    std::vector<HomeSection> out, rest;
+    const auto& hidden = app.cfg.homeHidden;
+    for (auto& f : {std::pair<const char*, const char*>{"#continue", "Continue Watching"},
+                    {"#mylist", "My List"}, {"#recent", "Recently Watched"}}) {
+        HomeSection s;
+        s.key = f.first;
+        s.title = f.second;
+        s.addonName = s.key == "#mylist" ? "Your Stremio library" : "Your watch history";
+        s.fixed = true;
+        s.on = std::find(hidden.begin(), hidden.end(), s.key) == hidden.end();
+        out.push_back(s);
+    }
+    std::set<std::string> used;
+    for (auto& type : catalogTypes(app.addons)) {
+        bool first = true;
+        for (auto& c : browsable(app.addons, type)) {
+            std::string key = c.addon->id + "/" + type + "/" + c.info.id;
+            if (!used.insert(key).second) continue;
+            HomeSection s;
+            s.key = key;
+            s.title = c.info.name + " " + typeLabel(type);
+            if (c.addon->id != "com.linvo.cinemeta") s.title += "  ·  " + c.addon->name;
+            s.type = type;
+            s.addonName = c.addon->name;
+            s.pick = c;
+            s.on = std::find(hidden.begin(), hidden.end(), key) == hidden.end();
+            bool lead = first && (type == "movie" || type == "series");
+            (lead ? out : rest).push_back(s);
+            first = false;
         }
     }
-
-    // "Top picks for you": the viewer's favorite genres mixed together
-    std::string type = onlyType;
-    if (type.empty()) {
-        auto recent = app.history.recentTitles(1);
-        type = recent.empty() ? "" : recent[0].type;
-    }
-    if (type.empty()) return;
-    std::vector<std::pair<Addon, CatalogInfo>> sources;
-    std::vector<std::string> extras;
-    for (auto& gname : app.history.topGenres(type, 3)) {
-        CatalogPick pick = genreCatalog(app.addons, type, gname);
-        if (!pick) continue;
-        sources.emplace_back(*pick.addon, pick.info);
-        extras.push_back("genre=" + urlEncode(gname));
-    }
-    if (sources.empty()) return;
-    Row r;
-    r.title = onlyType.empty() ? "Top Picks for You" : "Recommended " + typeLabel(type);
-    r.loader = mixedLoader(sources, extras, watched);
-    p.rows.push_back(std::move(r));
+    out.insert(out.end(), rest.begin(), rest.end());
+    const auto& order = app.cfg.homeOrder;
+    auto rank = [&](const HomeSection& s) {  // not placed yet: history rows on top, new catalogs at the end
+        auto it = std::find(order.begin(), order.end(), s.key);
+        return it != order.end() ? (size_t)(it - order.begin()) + 1 : s.fixed ? 0 : order.size() + 1;
+    };
+    std::stable_sort(out.begin(), out.end(), [&](const HomeSection& a, const HomeSection& b) { return rank(a) < rank(b); });
+    return out;
 }
 
 const char* const kPreferredGenres[] = {"Action",   "Comedy",  "Drama",     "Thriller",    "Sci-Fi",
@@ -480,13 +562,12 @@ const char* const kPreferredGenres[] = {"Action",   "Comedy",  "Drama",     "Thr
 class DiscoverPage {
 public:
     void reset(App& app) {
-        for (int t = 0; t < 2; t++) {
-            cats[t].clear();
-            for (auto& c : listCatalogs(app.addons)) {
-                if (c.type != (t == 0 ? "movie" : "series")) continue;
-                if (c.required && c.genres.empty()) continue;  // needs something we can't offer
-                cats[t].push_back(Cat{app.addons[c.addon], c});
-            }
+        types = catalogTypes(app.addons);
+        cats.assign(types.size(), {});
+        for (auto& c : listCatalogs(app.addons)) {
+            if (c.required && c.genres.empty()) continue;  // needs something we can't offer
+            size_t t = std::find(types.begin(), types.end(), c.type) - types.begin();
+            cats[t].push_back(Cat{app.addons[c.addon], c});
         }
         typeIdx = catIdx = genreIdx = 0;
         focus = 0;
@@ -556,7 +637,7 @@ public:
         Gfx& g = app.gfx;
         // Filter chips
         const auto& list = cats[typeIdx];
-        std::string labels[3] = {std::string("Type: ") + (typeIdx == 0 ? "Movies" : "Series"),
+        std::string labels[3] = {"Type: " + typeLabel(types.empty() ? "movie" : types[typeIdx]),
                                  "Catalog: " + (list.empty() ? std::string("none") : catLabel(list[catIdx])),
                                  "Genre: " + (list.empty() ? std::string("-") : genreLabel())};
         int x = 60;
@@ -600,7 +681,8 @@ private:
         Addon addon;
         CatalogInfo info;
     };
-    std::vector<Cat> cats[2];
+    std::vector<std::string> types;  // movie, series, then whatever else the addons have
+    std::vector<std::vector<Cat>> cats;  // per type
     int typeIdx = 0, catIdx = 0, genreIdx = 0;
     int focus = 0, chip = 0, sel = 0;
     float scroll = 0;
@@ -629,7 +711,8 @@ private:
 
     void cycle(int dir) {
         if (chip == 0) {
-            typeIdx = 1 - typeIdx;
+            int n = std::max(1, (int)types.size());
+            typeIdx = (typeIdx + dir + n) % n;
             catIdx = genreIdx = 0;
         } else if (chip == 1 && !cats[typeIdx].empty()) {
             int n = (int)cats[typeIdx].size();
@@ -688,7 +771,9 @@ class HomeScreen : public Screen {
     BrowsePage search;
     std::string query;
     int tab = TAB_HOME;
-    int seenAddons = -1, seenHistory = -1, seenLibrary = -1;
+    int seenAddons = -1, seenHistory = -1, seenLibrary = -1, seenHome = 0;
+    std::string removeId, removeName;  // title waiting for "Remove from your history?"
+    int removeBtn = 1;                 // 0 remove, 1 cancel
     float tabX = 0, tabW = 0;  // animated underline
 
     int accSel = 0;
@@ -702,66 +787,80 @@ public:
         search.emptyText = "Press Y to search movies and series";
     }
 
+    // Continue Watching, My List or Recently Watched: built from local data, nothing to fetch.
+    Row fixedRow(App& app, const std::string& key) {
+        Row r;
+        r.key = key;
+        r.loaded = true;
+        if (key == "#continue") {
+            r.title = "Continue Watching";
+            r.landscape = true;
+            for (auto& e : app.history.continueWatching(15)) {
+                Card c;
+                c.item = itemFromEntry(e);
+                c.isContinue = true;
+                c.fromHistory = true;
+                c.entry = e;
+                r.cards.push_back(c);
+            }
+        } else if (key == "#mylist") {
+            r.title = "My List";
+            for (auto& m : app.library.items()) r.cards.push_back(Card{m});
+        } else {
+            r.title = "Recently Watched";
+            for (auto& e : app.history.recentTitles(20)) {
+                Card c;
+                c.item = itemFromEntry(e);
+                c.fromHistory = true;
+                c.entry = e;
+                r.cards.push_back(c);
+            }
+        }
+        return r;
+    }
+
+    // The home rows in the Settings > Home sections order. Catalog rows found in `keep` are reused as
+    // they are (cards, loading state), so nothing is fetched again.
+    void composeHome(App& app, std::vector<Row> keep) {
+        std::vector<Row> rows;
+        bool heroMovie = false, heroSeries = false;  // the hero comes from the first movie and series rows
+        for (auto& s : homeSections(app)) {
+            if (!s.on) continue;
+            if (s.fixed) {
+                Row r = fixedRow(app, s.key);
+                if (!r.cards.empty()) rows.push_back(std::move(r));
+                continue;
+            }
+            auto it = std::find_if(keep.begin(), keep.end(), [&](const Row& k) { return k.key == s.key; });
+            Row r;
+            if (it != keep.end()) {
+                r = std::move(*it);
+            } else {
+                r.key = s.key;
+                r.title = s.title;
+                r.loader = catalogLoader(*s.pick.addon, s.pick.info, "");
+            }
+            r.feedsHero = (s.type == "movie" && !heroMovie) || (s.type == "series" && !heroSeries);
+            if (r.feedsHero) (s.type == "movie" ? heroMovie : heroSeries) = true;
+            rows.push_back(std::move(r));
+        }
+        pages[0].rows = std::move(rows);
+    }
+
+    // Progress or My List changed (back from the player): only the rows built from them change.
+    // Catalog rows and the hero keep what they loaded; fetching it all again right after playback,
+    // while a torrent may still be using the network, left rows and artwork missing.
+    void refreshFixedRows(App& app) {
+        BrowsePage& p = pages[0];
+        composeHome(app, std::move(p.rows));
+        p.toTop();
+    }
+
     void rebuildHome(App& app) {
         BrowsePage& p = pages[0];
         p.reset();
         p.emptyText = "Log in on the Account tab or add an addon to start browsing.";
-
-        Row cont;
-        cont.title = "Continue Watching";
-        cont.landscape = true;
-        cont.loaded = true;
-        for (auto& e : app.history.continueWatching(15)) {
-            Card c;
-            c.item = itemFromEntry(e);
-            c.isContinue = true;
-            c.entry = e;
-            cont.cards.push_back(c);
-        }
-        if (!cont.cards.empty()) p.rows.push_back(std::move(cont));
-
-        Row mine;
-        mine.title = "My List";
-        mine.loaded = true;
-        for (auto& m : app.library.items()) mine.cards.push_back(Card{m});
-        if (!mine.cards.empty()) p.rows.push_back(std::move(mine));
-
-        Row recent;
-        recent.title = "Recently Watched";
-        recent.loaded = true;
-        for (auto& e : app.history.recentTitles(20)) {
-            Card c;
-            c.item = itemFromEntry(e);
-            c.entry = e;
-            recent.cards.push_back(c);
-        }
-        if (!recent.cards.empty()) p.rows.push_back(std::move(recent));
-
-        addRecommendations(app, p, "");
-
-        std::set<std::string> used;
-        for (const char* type : {"movie", "series"}) {
-            auto cats = browsable(app.addons, type);
-            if (cats.empty()) continue;
-            Row r;
-            r.title = "Popular " + typeLabel(type);
-            r.feedsHero = true;
-            r.loader = catalogLoader(*cats[0].addon, cats[0].info, "");
-            used.insert(cats[0].addon->id + "/" + type + "/" + cats[0].info.id);
-            p.rows.push_back(std::move(r));
-        }
-        // Everything else the addons offer
-        for (const char* type : {"movie", "series"}) {
-            for (auto& c : browsable(app.addons, type)) {
-                std::string key = c.addon->id + "/" + type + "/" + c.info.id;
-                if (!used.insert(key).second) continue;
-                Row r;
-                r.title = c.info.name + " " + typeLabel(type);
-                if (c.addon->id != "com.linvo.cinemeta") r.title += "  ·  " + c.addon->name;
-                r.loader = catalogLoader(*c.addon, c.info, "");
-                p.rows.push_back(std::move(r));
-            }
-        }
+        composeHome(app, {});
     }
 
     void rebuildType(App& app, BrowsePage& p, const std::string& type) {
@@ -775,7 +874,6 @@ public:
             r.feedsHero = i == 0;
             r.loader = catalogLoader(*cats[i].addon, cats[i].info, "");
             p.rows.push_back(std::move(r));
-            if (i == 0) addRecommendations(app, p, type);
         }
         int genres = 0;
         for (const char* gname : kPreferredGenres) {
@@ -827,6 +925,11 @@ public:
                 break;
             }
             case PageAction::OtherStreams: app.push(makeStreamsScreen(a.entry, true)); break;
+            case PageAction::Remove:
+                removeId = a.entry.metaId;
+                removeName = a.entry.name.empty() ? a.item.name : a.entry.name;
+                removeBtn = 1;
+                break;
             case PageAction::None: break;
         }
     }
@@ -841,10 +944,13 @@ public:
             rebuildType(app, pages[2], "series");
             discover.reset(app);
             if (!query.empty()) startSearch(app, query);
+        } else if (app.homeVersion != seenHome) {
+            seenHome = app.homeVersion;
+            rebuildHome(app);  // sections edited in Settings
         } else if (app.historyVersion != seenHistory || app.libraryVersion != seenLibrary) {
             seenLibrary = app.libraryVersion;
             seenHistory = app.historyVersion;
-            rebuildHome(app);  // new progress / recommendations
+            refreshFixedRows(app);
         }
         if (loginTask.ready()) {
             auto r = loginTask.take();
@@ -859,6 +965,23 @@ public:
             }
         }
 
+        if (!removeId.empty()) {  // "Remove from your history?"
+            int tid = 0, ta = 0, tb = 0;
+            bool tap = app.tapped(tid, ta, tb) && tid == 13;
+            if (in.pressed(K_LEFT)) removeBtn = 0;
+            if (in.pressed(K_RIGHT)) removeBtn = 1;
+            if (tap) removeBtn = ta;
+            if (in.pressed(K_A) || tap) {
+                if (removeBtn == 0) {
+                    app.history.removeTitle(removeId);
+                    app.historyVersion++;
+                    app.toast("Removed " + removeName);
+                }
+                removeId.clear();
+            }
+            if (in.pressed(K_B)) removeId.clear();
+            return;
+        }
         if (in.pressed(K_PLUS)) {
             app.quit();
             return;
@@ -877,7 +1000,7 @@ public:
         } else if (tab == TAB_SEARCH) {
             if (in.pressed(K_Y) || (in.pressed(K_A) && search.rows.empty()) || tid == 30) {
                 std::string q;
-                if (showKeyboard(q, "Search movies and series", query) && !q.empty()) startSearch(app, q);
+                if (showKeyboard(app, q, "Search movies and series", query) && !q.empty()) startSearch(app, q);
                 return;
             }
             handle(app, search.update(app));
@@ -908,10 +1031,10 @@ public:
     // ------------------------------------------------ settings
 
     enum SettingId {
-        S_ACCOUNT, S_SAVE_SD, S_UPLOAD, S_SERVER,
+        S_ACCOUNT, S_AUTO_DOWNLOAD, S_UPLOAD, S_SERVER,
         S_PREF_QUALITY, S_PREF_SOURCE, S_AUTOPLAY, S_RESUME_STREAM,
         S_SUB_LANG, S_SUB_ADDONS, S_SUB_SIZE, S_SUB_POS, S_SUB_STYLE, S_SUB_COLOR, S_SUB_DELAY, S_SUB_STEP,
-        S_ADD_ADDON, S_REMOVE_ADDONS, S_RELOAD, S_CLEAR_HISTORY,
+        S_ADD_ADDON, S_REMOVE_ADDONS, S_HOME_SECTIONS, S_RELOAD, S_CLEAR_HISTORY,
     };
     enum SettingKind { Action, Toggle, Choice };
     struct SettingRow {
@@ -933,7 +1056,7 @@ public:
         int posIdx = std::max(0, std::min(3, (100 - c.subPos) / 5));
         return {
             {S_ACCOUNT, Action, c.authKey.empty() ? "Log in with a Stremio account" : "Log out", c.email, "Account"},
-            {S_SAVE_SD, Toggle, "Save torrents to SD card", "", "Torrents", c.saveDownloads},
+            {S_AUTO_DOWNLOAD, Toggle, "Download what I watch", "", "Torrents", c.autoDownload},
             {S_UPLOAD, Choice, "Torrent uploading",
              c.uploadMode == 0 ? "Off" : c.uploadMode == 1 ? "Limited" : "Normal", ""},
             {S_SERVER, Action, "Streaming server", c.server.empty() ? "Built-in engine" : c.server, ""},
@@ -953,7 +1076,8 @@ public:
             {S_SUB_DELAY, Choice, "Default delay", signedSeconds(c.subDelayMs), ""},
             {S_SUB_STEP, Choice, "Timing step in the player (L / R)", signedSeconds(c.subStepMs).substr(1), ""},
             {S_ADD_ADDON, Action, "Add addon by URL", "", "Addons & data"},
-            {S_REMOVE_ADDONS, Action, "Remove addons added by URL", std::to_string(c.addons.size()), ""},
+            {S_REMOVE_ADDONS, Action, "Manage addons", std::to_string(app.addons.size()) + " active", ""},
+            {S_HOME_SECTIONS, Action, "Home sections", "Show, hide and reorder", ""},
             {S_RELOAD, Action, "Reload addons and library", "", ""},
             {S_CLEAR_HISTORY, Action, "Clear watch history", "", ""},
         };
@@ -1028,10 +1152,10 @@ public:
         if (row.kind == Choice && (in.pressed(K_LEFT) || in.pressed(K_RIGHT))) adjust(app, row.id, in.pressed(K_RIGHT) ? 1 : -1, false);
         if (row.kind == Toggle && (in.pressed(K_LEFT) || in.pressed(K_RIGHT))) {
             bool on = in.pressed(K_RIGHT);
-            if (row.id == S_SAVE_SD) app.cfg.saveDownloads = on;
             if (row.id == S_SUB_ADDONS) app.cfg.subAddons = on;
             if (row.id == S_AUTOPLAY) app.cfg.autoplayNext = on;
             if (row.id == S_RESUME_STREAM) app.cfg.resumeSavedStream = on;
+            if (row.id == S_AUTO_DOWNLOAD) app.cfg.autoDownload = on;
             app.cfg.save();
         }
         if (!in.pressed(K_A) && !tapPress) return;
@@ -1047,8 +1171,8 @@ public:
                     app.toast("Logged out");
                 } else if (!loginTask.active()) {
                     std::string email, pass;
-                    if (!showKeyboard(email, "Stremio account e-mail", c.email) || email.empty()) break;
-                    if (!showKeyboard(pass, "Password", "", true) || pass.empty()) break;
+                    if (!showKeyboard(app, email, "Stremio account e-mail", c.email) || email.empty()) break;
+                    if (!showKeyboard(app, pass, "Password", "", true) || pass.empty()) break;
                     pendingEmail = email;
                     loginTask.start([email, pass]() {
                         std::pair<std::string, std::string> r;
@@ -1058,12 +1182,6 @@ public:
                     app.toast("Logging in...");
                 }
                 break;
-            case S_SAVE_SD:
-                c.saveDownloads = !c.saveDownloads;
-                c.save();
-                app.toast(c.saveDownloads ? "Torrents you play will be saved to the SD card"
-                                          : "Torrents will only be streamed");
-                break;
             case S_AUTOPLAY:
                 c.autoplayNext = !c.autoplayNext;
                 c.save();
@@ -1072,13 +1190,19 @@ public:
                 c.resumeSavedStream = !c.resumeSavedStream;
                 c.save();
                 break;
+            case S_AUTO_DOWNLOAD:
+                c.autoDownload = !c.autoDownload;
+                c.save();
+                app.toast(c.autoDownload ? "Torrents you watch will also be saved to the SD card"
+                                         : "Torrents will only be streamed (- in the stream list downloads one)");
+                break;
             case S_SUB_ADDONS:
                 c.subAddons = !c.subAddons;
                 c.save();
                 break;
             case S_SERVER: {
                 std::string s;
-                if (showKeyboard(s, "stremio-server URL (empty = built-in engine)", c.server.empty() ? "http://" : c.server)) {
+                if (showKeyboard(app, s, "stremio-server URL (empty = built-in engine)", c.server.empty() ? "http://" : c.server)) {
                     while (!s.empty() && (s.back() == ' ' || s.back() == '/')) s.pop_back();
                     c.server = (s == "http:" || s == "http://") ? "" : s;
                     c.save();
@@ -1087,7 +1211,7 @@ public:
             }
             case S_ADD_ADDON: {
                 std::string u;
-                if (showKeyboard(u, "Addon manifest URL", "https://") && u.size() > 8) {
+                if (showKeyboard(app, u, "Addon manifest URL", "https://") && u.size() > 8) {
                     c.addons.push_back(normalizeAddonUrl(u));
                     c.save();
                     app.reloadAddons();
@@ -1095,11 +1219,8 @@ public:
                 }
                 break;
             }
-            case S_REMOVE_ADDONS:
-                c.addons.clear();
-                c.save();
-                app.reloadAddons();
-                break;
+            case S_REMOVE_ADDONS: app.push(makeAddonsScreen()); break;
+            case S_HOME_SECTIONS: app.push(makeHomeSectionsScreen()); break;
             case S_RELOAD: app.reloadAddons(); break;
             case S_CLEAR_HISTORY:
                 app.history = History();
@@ -1200,10 +1321,11 @@ public:
                           "Normal: up to 6 people, no limit (fastest).",
                           px + 20, vy + 162, 16, col::dim, pw - 40, 80);
         } else {
-            g.textWrapped(app.cfg.saveDownloads
-                              ? "Save to SD card is on: torrents you play are downloaded completely and keep "
-                                "downloading after you stop watching. Manage them in the Downloads tab."
-                              : "Torrents play with the built-in engine. Set a streaming server only to send them "
+            g.textWrapped(app.cfg.autoDownload
+                              ? "Download what I watch is on: torrents you play are also saved completely to the SD "
+                                "card and keep downloading after you stop watching. Manage them in the Downloads tab."
+                              : "Torrents only stream, nothing is saved. To keep one on the SD card (for a trip), "
+                                "press - on it in the stream list. Set a streaming server only to send torrents "
                                 "through a PC running Stremio.",
                           px, 370, 17, col::faint, pw, 90);
         }
@@ -1278,12 +1400,18 @@ public:
             d = dls[dlSel];
         }
         if (in.pressed(K_A) || tapOpen) {
-            if (d.complete) {
-                if (fileExists(d.file))
-                    app.requestPlay(d.file, d.ctx, true);
-                else
-                    app.toast("The file is missing from the SD card");
-            } else if (app.findDownload(d.infoHash, d.fileIdx)) {
+            if (d.complete && !fileExists(d.file)) {
+                app.toast("The file is missing from the SD card");
+            } else {  // finished: the file; still downloading: what is saved plays now, peers fill the rest
+                Stream s;
+                s.addonName = "Downloads";
+                s.infoHash = d.infoHash;
+                s.fileIdx = d.fileIdx;
+                s.trackers = d.trackers;
+                playStream(app, s, d.ctx, true, false);
+            }
+        } else if (in.pressed(K_X) && !d.complete) {
+            if (app.findDownload(d.infoHash, d.fileIdx)) {
                 app.stopDownload(d.infoHash, d.fileIdx);
                 app.toast("Download paused");
             } else {
@@ -1306,8 +1434,7 @@ public:
 
         if (dls.empty()) {
             g.text("No downloads yet", W / 2, 300, 26, col::text, 0, AlignCenter);
-            g.text(app.cfg.saveDownloads ? "Play a torrent stream and it will be saved here."
-                                         : "Turn on \"Save torrents to SD card\" in Settings, then play a torrent.",
+            g.text("Press - on a torrent in the stream list (pick an episode or movie first) to download it.",
                    W / 2, 344, 20, col::dim, W - 120, AlignCenter);
             return;
         }
@@ -1402,6 +1529,24 @@ public:
         g.roundRect((int)tabX, 56, (int)tabW, 4, 2, col::accent);
     }
 
+    void drawRemoveConfirm(App& app) {
+        Gfx& g = app.gfx;
+        g.rect(0, 0, W, H, col::black.alpha(170));
+        int pw = 640, ph = 240, px = (W - pw) / 2, py = (H - ph) / 2;
+        g.roundRect(px, py, pw, ph, 20, col::bar);
+        g.roundOutline(px, py, pw, ph, 20, 1, col::white.alpha(40));
+        g.text("Remove " + removeName + "?", px + 36, py + 30, 28, col::text, pw - 72);
+        g.textWrapped("It leaves Continue Watching and Recently Watched on this Switch, with its progress. "
+                      "Watching it again brings it back.",
+                      px + 36, py + 80, 18, col::dim, pw - 72, 70);
+        int bw0 = buttonWidth(g, "Remove", IconNone), bw1 = buttonWidth(g, "Cancel", IconNone);
+        drawButton(g, px + 36, py + 160, bw0, 50, "Remove", removeBtn == 0, removeBtn == 0, IconNone);
+        drawButton(g, px + 54 + bw0, py + 160, bw1, 50, "Cancel", removeBtn == 1, false, IconNone);
+        app.hit(px + 36, py + 160, bw0, 50, 13, 0);
+        app.hit(px + 54 + bw0, py + 160, bw1, 50, 13, 1);
+        app.drawFooter("A Confirm   B Cancel");
+    }
+
     void draw(App& app) override {
         switch (tab) {
             case TAB_HOME:
@@ -1409,8 +1554,14 @@ public:
             case TAB_SERIES:
                 pageFor(tab)->draw(app);
                 drawNav(app);
-                app.drawFooter(tab == TAB_HOME ? "A Select   X Other stream   Y Details   L/R Tabs   + Exit"
-                                               : "A Select   Y Details   L/R Tabs   + Exit");
+                if (tab == TAB_HOME && !removeId.empty())
+                    drawRemoveConfirm(app);
+                else if (tab == TAB_HOME)
+                    app.drawFooter(pages[0].historyFocused()
+                                       ? "A Select   X Other stream   Y Details   - Remove   L/R Tabs   + Exit"
+                                       : "A Select   X Other stream   Y Details   L/R Tabs   + Exit");
+                else
+                    app.drawFooter("A Select   Y Details   L/R Tabs   + Exit");
                 break;
             case TAB_DISCOVER:
                 discover.draw(app);
@@ -1431,7 +1582,7 @@ public:
                 else if (dls.empty())
                     app.drawFooter("L/R Tabs   + Exit");
                 else
-                    app.drawFooter(std::string(dls[dlSel].complete ? "A Play" : "A Pause/Resume") +
+                    app.drawFooter(std::string(dls[dlSel].complete ? "A Play" : "A Watch   X Pause/Resume") +
                                    "   Y Delete   L/R Tabs   + Exit");
                 break;
             case TAB_SETTINGS:
@@ -1447,4 +1598,114 @@ public:
 
 std::unique_ptr<Screen> makeHomeScreen() {
     return std::make_unique<HomeScreen>();
+}
+
+// ---------------------------------------------------------------- Settings > Home sections
+
+// Every catalog row of the home screen: switch each one on or off and move it up or down. The home
+// screen is rebuilt when leaving, so browsing here doesn't refetch anything.
+class HomeSectionsScreen : public Screen {
+    std::vector<HomeSection> list;
+    bool loaded = false, changed = false;
+    int sel = 0;
+    float scroll = 0;
+    static const int top = 140, rowH = 72, gap = 8, visible = 7;
+    static const int toggleX = W - 84 - 56, upX = W - 84 - 56 - 130, downX = W - 84 - 56 - 76;
+
+    void save(App& app) {
+        Config& c = app.cfg;
+        c.homeOrder.clear();
+        c.homeHidden.clear();
+        for (auto& s : list) {
+            c.homeOrder.push_back(s.key);
+            if (!s.on) c.homeHidden.push_back(s.key);
+        }
+        c.save();
+        changed = true;
+    }
+
+    void move(App& app, int dir) {
+        int to = sel + dir;
+        if (to < 0 || to >= (int)list.size()) return;
+        std::swap(list[sel], list[to]);
+        sel = to;
+        save(app);
+    }
+
+public:
+    void update(App& app) override {
+        if (!loaded && !app.addonsLoading()) {
+            loaded = true;
+            list = homeSections(app);
+        }
+        const Input& in = app.in;
+        int id = 0, a = 0, b = 0;
+        bool tap = app.tapped(id, a, b);
+        if (in.pressed(K_B) || (tap && id == kHitBack)) {
+            if (changed) app.homeVersion++;
+            app.pop();
+            return;
+        }
+        int n = (int)list.size();
+        if (n == 0) return;
+        if (in.pressed(K_DOWN) && sel + 1 < n) sel++;
+        if (in.pressed(K_UP) && sel > 0) sel--;
+        bool flip = in.pressed(K_A);
+        int dir = in.pressed(K_L) ? -1 : in.pressed(K_R) ? 1 : 0;
+        if (tap && a < n) {
+            if (id == 91) flip = true;            // the switch
+            if (id == 92) dir = -1;               // up arrow
+            if (id == 93) dir = 1;                // down arrow
+            if (id == 90) flip = sel == a;        // a row: first tap selects, the second switches
+            sel = a;
+        }
+        if (flip) {
+            list[sel].on = !list[sel].on;
+            save(app);
+        }
+        if (dir) move(app, dir);
+    }
+
+    void draw(App& app) override {
+        Gfx& g = app.gfx;
+        g.text("Home sections", 60, 40, 34, col::text);
+        int on = 0;
+        for (auto& s : list) on += s.on;
+        g.text(!loaded ? "Loading addons..." : std::to_string(on) + " of " + std::to_string(list.size()) + " shown", 60, 90,
+               19, col::dim);
+        drawBackButton(app);
+
+        float target = (float)std::max(0, sel - (visible - 2)) * (rowH + gap);
+        scroll = approach(scroll, target, 0.25f);
+        g.clip(0, top - 6, W, H - top - 40);
+        for (int i = 0; i < (int)list.size(); i++) {
+            int y = top + i * (rowH + gap) - (int)scroll;
+            if (y + rowH < top - 6 || y > H) continue;
+            const HomeSection& s = list[i];
+            bool f = i == sel;
+            g.roundRect(60, y, W - 120, rowH, 14, f ? col::cardSel.alpha(240) : col::card.alpha(200));
+            if (f) g.roundOutline(60, y, W - 120, rowH, 14, 2, col::accentLight);
+            app.hit(60, std::max(y, top - 6), W - 120, rowH, 90, i);
+            g.text(std::to_string(i + 1), 84, y + 22, 22, col::faint);
+            g.text(s.title, 130, y + 10, 22, s.on ? col::text : col::dim, 760);
+            g.text(s.fixed ? s.addonName : typeLabel(s.type) + "  ·  " + s.addonName, 130, y + 40, 15, col::faint, 760);
+            // Up / down arrows and the on / off switch
+            g.roundRect(upX, y + 20, 44, 32, 16, col::white.alpha(30));
+            g.triangle(upX + 12, y + 42, upX + 32, y + 42, upX + 22, y + 30, col::text);
+            app.hit(upX, y + 16, 44, 40, 92, i);
+            g.roundRect(downX, y + 20, 44, 32, 16, col::white.alpha(30));
+            g.triangle(downX + 12, y + 30, downX + 32, y + 30, downX + 22, y + 42, col::text);
+            app.hit(downX, y + 16, 44, 40, 93, i);
+            g.roundRect(toggleX, y + 22, 56, 28, 14, s.on ? col::accent : col::white.alpha(50));
+            g.circle(toggleX + (s.on ? 42.0f : 14.0f), y + 36.0f, 11, col::white);
+            app.hit(toggleX - 8, y + 12, 72, 48, 91, i);
+        }
+        g.unclip();
+        if (loaded && list.empty()) g.text("No catalogs: add an addon with catalogs", W / 2, 300, 22, col::dim, 0, AlignCenter);
+        app.drawFooter("A Show / hide   L/R Move up / down   B Back");
+    }
+};
+
+std::unique_ptr<Screen> makeHomeSectionsScreen() {
+    return std::make_unique<HomeSectionsScreen>();
 }

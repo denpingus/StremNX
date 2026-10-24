@@ -32,6 +32,7 @@ struct CatalogInfo {
 struct MetaItem {
     std::string id, type, name, poster, releaseInfo;
     std::string background, logo, description, imdbRating;
+    std::string posterShape;  // "poster" (2:3, default), "landscape" (16:9) or "square", as the addon says
     std::vector<std::string> genres;
 };
 

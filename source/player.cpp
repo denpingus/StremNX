@@ -27,6 +27,7 @@ void* getProcAddress(void*, const char* name) {
 
 SDL_GLContext createContext(SDL_Window* win) {
     SDL_GL_ResetAttributes();
+    requestColorDepth();
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -76,7 +77,9 @@ struct Observed {
     std::vector<TrackInfo> tracks;
 };
 
-enum ObsId { ObsPos = 1, ObsDur, ObsPause, ObsPausedForCache, ObsSeeking, ObsBuffer, ObsCacheTime, ObsTracks, ObsSid, ObsSubLang };
+enum ObsId { ObsPos = 1, ObsDur, ObsPause, ObsPausedForCache, ObsSeeking, ObsBuffer, ObsCacheTime, ObsTracks, ObsSid, ObsSubLang,
+             ObsHwdec, ObsCodec,      // only logged
+             ObsWidth, ObsGamma };    // pick light rendering for heavy videos
 
 void observeAll(mpv_handle* mpv) {
     mpv_observe_property(mpv, ObsPos, "time-pos", MPV_FORMAT_DOUBLE);
@@ -89,6 +92,10 @@ void observeAll(mpv_handle* mpv) {
     mpv_observe_property(mpv, ObsTracks, "track-list", MPV_FORMAT_NODE);
     mpv_observe_property(mpv, ObsSid, "sid", MPV_FORMAT_STRING);
     mpv_observe_property(mpv, ObsSubLang, "current-tracks/sub/lang", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsHwdec, "hwdec-current", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsCodec, "video-format", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsWidth, "video-params/w", MPV_FORMAT_INT64);
+    mpv_observe_property(mpv, ObsGamma, "video-params/gamma", MPV_FORMAT_STRING);
 }
 
 std::vector<TrackInfo> parseTracks(const mpv_node& list) {
@@ -147,6 +154,34 @@ std::string clock(double s) {
     else
         snprintf(buf, sizeof(buf), "%d:%02d", t / 60, t % 60);
     return buf;
+}
+
+// The gyro pointer is drawn straight into each frame after mpv, so it moves at the display rate (the
+// OSD is re-rendered by mpv at its own pace). A disc of scissored clears, one per row: no shaders needed.
+void drawPointerGl(float x, float y, int w, int h) {
+    using Scissor = void (*)(int, int, int, int);
+    using Cap = void (*)(unsigned);
+    using ClearColor = void (*)(float, float, float, float);
+    static auto scissor = (Scissor)SDL_GL_GetProcAddress("glScissor");
+    static auto enable = (Cap)SDL_GL_GetProcAddress("glEnable");
+    static auto disable = (Cap)SDL_GL_GetProcAddress("glDisable");
+    static auto clearColor = (ClearColor)SDL_GL_GetProcAddress("glClearColor");
+    static auto clear = (Cap)SDL_GL_GetProcAddress("glClear");
+    if (!scissor || !enable || !disable || !clearColor || !clear) return;
+    const unsigned kScissorTest = 0x0C11, kColorBit = 0x4000;
+    float s = w / 1280.0f;  // 1280x720 coordinates to the drawable (1920x1080 docked)
+    int cx = (int)(x * s), cy = h - (int)(y * s);  // GL counts rows from the bottom
+    enable(kScissorTest);
+    for (auto [radius, shade] : {std::pair<float, float>{12, 0.08f}, {8, 1.0f}}) {
+        clearColor(shade, shade, shade, 1);
+        int r = (int)(radius * s);
+        for (int dy = -r; dy < r; dy++) {
+            int half = (int)std::sqrt((float)r * r - (dy + 0.5f) * (dy + 0.5f));
+            scissor(cx - half, cy + dy, 2 * half, 1);
+            clear(kColorBit);
+        }
+    }
+    disable(kScissorTest);
 }
 
 // ---------------------------------------------------------------- torrent:// protocol
@@ -260,11 +295,17 @@ public:
         shape(p, c);
     }
 
+    // Layers stacked from the strong edge, each a little shorter: strips laid side by side leave a
+    // visible line wherever their antialiased edges meet (or overlap).
     void gradientV(float y, float h, Color c, Uint8 a0, Uint8 a1, int steps = 18) {
-        float sh = h / steps;
-        for (int i = 0; i < steps; i++) {
-            float t = (i + 0.5f) / steps;
-            rect(0, y + i * sh, 1280, sh + 0.6f, c.alpha((Uint8)(a0 + (a1 - a0) * t)));
+        float sh = h / steps, covered = 0;
+        for (int i = 0; i < steps; i++) {  // weakest band first
+            int band = a1 > a0 ? i : steps - 1 - i;
+            float want = (a0 + (a1 - a0) * (band + 0.5f) / steps) / 255.0f;
+            float layer = 1 - (1 - want) / (1 - covered);  // opacity that brings `covered` up to `want`
+            covered = want;
+            float top = a1 > a0 ? y + band * sh : y, bottom = a1 > a0 ? y + h : y + (band + 1) * sh;
+            rect(0, top, 1280, bottom - top, c.alpha((Uint8)std::lround(layer * 255)));
         }
     }
 
@@ -293,6 +334,13 @@ public:
             circle(cx + std::cos(a) * r, cy + std::sin(a) * r, r * 0.16f,
                    col::accentLight.alpha((Uint8)(255 * (1.0f - age * 0.85f))));
         }
+    }
+
+    void lockIcon(float cx, float cy, float s, Color c) {
+        rect(cx - s * 0.55f, cy - s * 1.1f, s * 0.22f, s * 0.9f, c);  // shackle
+        rect(cx + s * 0.33f, cy - s * 1.1f, s * 0.22f, s * 0.9f, c);
+        rect(cx - s * 0.55f, cy - s * 1.1f, s * 1.1f, s * 0.22f, c);
+        roundRect(cx - s * 0.8f, cy - s * 0.3f, s * 1.6f, s * 1.2f, s * 0.2f, c);  // body
     }
 
     void playIcon(float x, float cy, float s, Color c) { poly({x, cy - s, x, cy + s, x + s * 1.7f, cy}, c); }
@@ -393,6 +441,14 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
     SDL_GL_MakeCurrent(win, gl);
     SDL_GL_SetSwapInterval(1);
+    // mpv dithers for the framebuffer's color depth: tell it what the system really gave us.
+    int rb = 0, gb = 0, bb = 0;
+    SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &rb);
+    SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &gb);
+    SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &bb);
+    int fbDepth = std::min({rb, gb, bb});
+    logMsg("player: framebuffer %d/%d/%d bits", rb, gb, bb);
+    if (fbDepth <= 0) fbDepth = 8;
 
     mpv_handle* mpv = mpv_create();
     if (!mpv) {
@@ -402,6 +458,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
     setOpt(mpv, "vo", "libmpv");
     setOpt(mpv, "hwdec", "auto");
+    setOpt(mpv, "dither", app.cfg.dither ? "fruit" : "no");  // see Config::dither
     setOpt(mpv, "cache", "yes");
     setOpt(mpv, "demuxer-max-bytes", "48MiB");
     setOpt(mpv, "demuxer-max-back-bytes", "8MiB");
@@ -409,6 +466,11 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     setOpt(mpv, "user-agent", "StremNX/0.3.1");
     setOpt(mpv, "keep-open", "no");
     setOpt(mpv, "volume-max", "200");
+    // The console plays stereo. Left to "auto", 5.1 tracks reach the audio output as 6 channels and the
+    // center one (where the dialogue is) can be lost: voices vanish and the movie sounds quiet.
+    // Downmixing in mpv folds the center into both sides.
+    setOpt(mpv, "audio-channels", "stereo");
+    setOpt(mpv, "volume", std::to_string(app.cfg.volume).c_str());
     setOpt(mpv, "osd-level", "1");
     setOpt(mpv, "osd-bar", "no");
     setOpt(mpv, "osd-on-seek", "no");
@@ -431,6 +493,9 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     setOpt(mpv, "sub-scale", num);
     setOpt(mpv, "sub-pos", std::to_string(cfg.subPos).c_str());
     setOpt(mpv, "sub-color", cfg.subColor ? "#FFE600" : "#FFFFFF");
+    // Styled subtitles (ASS/SSA, common in series) bring their own color, box and size: the Settings
+    // style applies to every subtitle instead, so all videos look the same.
+    setOpt(mpv, "sub-ass-override", "force");
     if (cfg.subStyle == 1) {
         if (mpv_set_option_string(mpv, "sub-border-style", "background-box") < 0)
             setOpt(mpv, "sub-border-style", "opaque-box");
@@ -483,6 +548,9 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (!cands.empty()) subsTask.start([cands, type, vid, code]() { return fetchAddonSubs(cands, type, vid, code); });
     }
     bool fileLoaded = false;
+    int64_t videoW = 0;  // video width and transfer (pq / hlg = HDR), to spot heavy videos
+    std::string videoGamma;
+    bool lightRendering = false;
     Observed obs;
     observeAll(mpv);
     double subDelay = cfg.subDelayMs / 1000.0, subScale = cfg.subSize / 100.0;
@@ -500,6 +568,15 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     int seekAcc = 0;
     std::string lastSubId = "auto";
     std::string lastAss;
+    bool scrubbing = false;  // finger on the progress bar
+    double scrubFrac = 0;
+    int sideTap = 0;  // -1 left, 1 right: a second quick tap there skips 10 s
+    uint32_t sideTapAt = 0;
+    // Locked: touch and buttons do nothing (no accidental skips). Any input shows a badge; tapping it
+    // twice, or pressing - twice, unlocks. Locks by itself after 30 s without input while playing.
+    bool locked = false, unlockArmed = false;
+    bool hintTouch = false;  // the badge explains the touch way or the controller way, whichever was used
+    uint32_t lockHintAt = 0, lockPressAt = 0;  // controller: any two quick presses unlock
 
     // Menu: 0 audio, 1 subtitles, 2 playback options
     bool menuOpen = false;
@@ -511,6 +588,8 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     static const char* zoomNames[] = {"Off", "+7%", "+15%", "+23%"};
     static const int volumes[] = {100, 125, 150, 200};
     int speedIdx = 2, aspectIdx = 0, zoomIdx = 0, volumeIdx = 0;
+    for (int i = 0; i < 4; i++)
+        if (volumes[i] == app.cfg.volume) volumeIdx = i;
 
     // Up next (series)
     std::string nextId = !ctx.nextVideoId.empty() ? ctx.nextVideoId : guessNextEpisode(ctx.videoId, false);
@@ -540,6 +619,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             if (subs[i].selected) menuSel[1] = i;
         menuCol = audio.empty() ? 1 : 0;
         menuOpen = true;
+        scrubbing = false;
     };
 
     auto optionLabel = [&](int i) -> std::string {
@@ -548,7 +628,8 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             case 0: snprintf(b, sizeof(b), "Speed: %gx", speeds[speedIdx]); return b;
             case 1: return std::string("Aspect: ") + aspects[aspectIdx];
             case 2: return std::string("Zoom: ") + zoomNames[zoomIdx];
-            default: snprintf(b, sizeof(b), "Volume: %d%%", volumes[volumeIdx]); return b;
+            case 3: snprintf(b, sizeof(b), "Volume: %d%%", volumes[volumeIdx]); return b;
+            default: return std::string("Dithering: ") + (app.cfg.dither ? "On" : "Off");
         }
     };
 
@@ -579,6 +660,11 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                 setAsync(mpv, "volume", v);
                 break;
             }
+            case 4:  // live, to compare on the same scene: dithering hides banding but can speckle dark areas
+                app.cfg.dither = !app.cfg.dither;
+                app.cfg.save();
+                setAsync(mpv, "dither", app.cfg.dither ? "fruit" : "no");
+                break;
         }
     };
 
@@ -607,8 +693,11 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     const float colX[3] = {130, 520, 910};
     auto menuItemY = [](int i, int first) { return 210.0f + (i - first) * 44; };
     auto menuFirst = [&](int c) { return std::max(0, menuSel[c] - 8); };
-    auto menuCount = [&](int c) { return c == 0 ? (int)audio.size() : c == 1 ? (int)subs.size() : 4; };
+    auto menuCount = [&](int c) { return c == 0 ? (int)audio.size() : c == 1 ? (int)subs.size() : 5; };
 
+    // Watching over the network comes first: background downloads wait (not when playing from the SD card).
+    bool fromSd = url.compare(0, 5, "sdmc:") == 0;
+    for (auto& t : app.downloads) t->yieldNetwork(t != app.activeTorrent && !fromSd);
     while (!quit && appletMainLoop()) {
         SDL_Event e;
         while (SDL_PollEvent(&e))
@@ -616,6 +705,8 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
 
         watchBeat(WatchMain, "player: input");
         Input& in = app.in;
+        in.dragKeys = menuOpen;  // a swipe on the video would otherwise seek 10 s at a time
+        in.pointerEnabled = !locked;  // locked means locked: no pointer either
         in.update();
         uint32_t now = SDL_GetTicks();
 
@@ -631,13 +722,42 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         lastWall = wall;
 
         bool anyInput = in.pressed(K_A | K_B | K_X | K_Y | K_UP | K_DOWN | K_LEFT | K_RIGHT | K_ZL | K_ZR | K_L |
-                                   K_R | K_MINUS | K_PLUS);
+                                   K_R | K_MINUS | K_PLUS | K_LSTICK);
         int tx = 0, ty = 0;
         bool tap = in.tap(tx, ty);
+        int ptrX = 0, ptrY = 0;
+        bool pointing = in.pointer(ptrX, ptrY);
+        if (pointing) lastInput = now;  // like a mouse: pointing shows the controls
         bool controlsVisible = now - lastInput < 4000 || paused;
         if (anyInput || tap) lastInput = now;
 
-        if (menuOpen) {
+        if (locked) {
+            bool badge = now - lockHintAt < 3000;
+            bool onBadge = tap && badge && tx >= 420 && tx < 900 && ty < 110;
+            // Any physical button unlocks (twice, quickly), the D-pad included; tilting a stick only shows
+            // how, so brushing one never unlocks.
+            bool button = in.pressed(K_A | K_B | K_X | K_Y | K_L | K_R | K_ZL | K_ZR | K_PLUS | K_MINUS | K_LSTICK) ||
+                          in.dpadPressed();
+            if (!badge) unlockArmed = false;
+            if (button) {  // controller: any button twice, quickly (either Joy-Con)
+                if (now - lockPressAt < 400) locked = false;
+                lockPressAt = now;
+                hintTouch = false;
+            } else if (onBadge) {  // touch: the badge, twice
+                if (unlockArmed) locked = false;
+                unlockArmed = !unlockArmed;
+                hintTouch = true;
+            } else if (tap) {
+                hintTouch = true;
+            } else if (anyInput) {
+                hintTouch = false;
+            }
+            lockHintAt = anyInput || tap ? now : lockHintAt;
+            if (!locked) {
+                unlockArmed = false;
+                lastInput = now;  // show the controls again
+            }
+        } else if (menuOpen) {
             if (tap) {  // touch: pick an item, or tap outside the columns to close
                 bool hitItem = false;
                 for (int c = 0; c < 3; c++) {
@@ -692,28 +812,65 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                 flash = off ? "Subtitles on" : "Subtitles off";
                 flashAt = now;
             }
-            if (in.pressed(K_MINUS)) command(mpv, "script-binding", "stats/display-stats-toggle");
+            if (in.pressed(K_LSTICK)) command(mpv, "script-binding", "stats/display-stats-toggle");
+            if (in.pressed(K_MINUS) && started) {
+                locked = true;
+                unlockArmed = hintTouch = false;
+                lockHintAt = now;
+            }
 
-            // Touch: first tap shows the controls; then the bar seeks, the sides skip, the middle pauses.
-            if (tap && controlsVisible && started) {
+            // Touch: first tap shows the controls; then the bar seeks (tap or drag, applied on release),
+            // the buttons row works like the buttons, the sides skip and the middle pauses.
+            int fx = 0, fy = 0, fsx = 0, fsy = 0;
+            bool finger = in.touch(fx, fy, fsx, fsy), scrubEnded = false;
+            if (finger && !scrubbing && controlsVisible && started && dur > 0 && fsy >= 585 && fsy < 648 &&
+                fsx >= 40 && fsx < 1140)
+                scrubbing = true;
+            if (scrubbing) {
+                lastInput = now;
+                if (finger) {
+                    scrubFrac = std::max(0.0, std::min(1.0, (fx - 60) / 1060.0));
+                } else {
+                    std::string to = std::to_string((int)(dur * scrubFrac));
+                    const char* args[] = {"seek", to.c_str(), "absolute", nullptr};
+                    mpv_command_async(mpv, 0, args);
+                    scrubbing = false;
+                    scrubEnded = true;
+                }
+            }
+            // Sides: a double tap skips 10 s (each further quick tap adds 10 more); one tap does nothing.
+            int side = tap && started && ty >= 140 && ty < 585 ? (tx < 400 ? -1 : tx > 880 ? 1 : 0) : 0;
+            if (side) {
+                if (side == sideTap && now - sideTapAt < 400) seekBy(10 * side);
+                sideTap = side;
+                sideTapAt = now;
+            }
+            if (tap && controlsVisible && started && !scrubEnded) {
                 if (ty < 120 && tx < 420) {
                     quit = true;  // title / back area
-                } else if (ty >= 640 && tx >= 840 && tx < 1080) {
-                    openMenu();
-                } else if (ty >= 595 && ty < 640 && tx >= 50 && tx < 1130 && dur > 0) {
+                } else if (ty < 120 && tx >= 1110) {
+                    locked = true;
+                    unlockArmed = false;
+                    hintTouch = true;
+                    lockHintAt = now;
+                } else if (ty >= 585 && ty < 648 && tx >= 40 && tx < 1140 && dur > 0) {  // bar (pointer click)
                     std::string to = std::to_string((int)(dur * std::max(0.0, std::min(1.0, (tx - 60) / 1060.0))));
                     const char* args[] = {"seek", to.c_str(), "absolute", nullptr};
                     mpv_command_async(mpv, 0, args);
-                } else if (ty >= 140 && ty < 590) {
-                    if (tx < 400) seekBy(-10);
-                    else if (tx > 880) seekBy(10);
-                    else command(mpv, "cycle", "pause");
+                } else if (ty >= 648) {  // buttons row
+                    if (tx < 150) command(mpv, "cycle", "pause");
+                    else if (tx < 213) seekBy(-10);
+                    else if (tx < 270) seekBy(10);
+                    else if (tx >= 840 && tx < 1080) openMenu();
+                    else if (tx >= 1140) quit = true;
+                } else if (ty >= 140 && ty < 585 && !side) {
+                    command(mpv, "cycle", "pause");
                 }
             }
         }
 
         // Subtitle timing (L/R, also inside the menu) and size (ZL/ZR inside the menu)
-        if (in.pressed(K_L) || in.pressed(K_R)) {
+        if (!locked && (in.pressed(K_L) || in.pressed(K_R))) {
             subDelay += (in.pressed(K_R) ? 1 : -1) * cfg.subStepMs / 1000.0;
             if (std::fabs(subDelay) < 0.001) subDelay = 0;
             setAsync(mpv, "sub-delay", subDelay);
@@ -753,7 +910,22 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             if (ev->event_id == MPV_EVENT_NONE) break;
             if (ev->event_id == MPV_EVENT_SHUTDOWN) quit = true;
             if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) started = true;
-            if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) applyProperty(obs, ev);
+            if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) {
+                applyProperty(obs, ev);
+                auto* p = static_cast<mpv_event_property*>(ev->data);
+                if ((ev->reply_userdata == ObsHwdec || ev->reply_userdata == ObsCodec) && p->format == MPV_FORMAT_STRING)
+                    logMsg("player: %s = %s", p->name, *(char**)p->data);  // which decoder a video really got
+                if (ev->reply_userdata == ObsWidth && p->format == MPV_FORMAT_INT64) videoW = *(int64_t*)p->data;
+                if (ev->reply_userdata == ObsGamma && p->format == MPV_FORMAT_STRING) videoGamma = *(char**)p->data;
+                // 4K or HDR only: light scaling and HDR handling. mpv's high quality downscaling and HDR peak
+                // detection made those stutter on the Tegra GPU, but on everything else (1080p is downscaled
+                // too in handheld) the light filters make film grain and fine texture look noisy.
+                if (!lightRendering && (videoW > 2560 || videoGamma == "pq" || videoGamma == "hlg")) {
+                    lightRendering = true;
+                    command(mpv, "apply-profile", "fast");
+                    logMsg("player: heavy video (%lld px wide, %s): light rendering", (long long)videoW, videoGamma.c_str());
+                }
+            }
             if (ev->event_id == MPV_EVENT_FILE_LOADED) {
                 fileLoaded = true;
                 if (retries > 0)  // a reconnect reloaded the file: put the addon subtitles back
@@ -806,6 +978,13 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (upNextOn && !upCancelled && !upShown && started && dur > 60 && dur - pos <= 20 && !menuOpen) {
             upShown = true;
             upShownAt = now;
+            locked = false;  // the card needs A / B
+        }
+        if (!started) locked = false;  // the loading screen (reconnecting) must take B
+        if (!locked && started && !paused && !buffering && !menuOpen && !upShown && !scrubbing &&
+            now - lastInput > 30000) {
+            locked = true;
+            unlockArmed = false;
         }
         int countdown = upShown ? 10 - (int)((now - upShownAt) / 1000) : 10;
         if (upShown && countdown <= 0) {
@@ -817,7 +996,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         watchBeat(WatchMain, "player: overlay");
         if (now - lastDraw > 66) {
             lastDraw = now;
-            bool controls = now - lastInput < 4000 || paused;
+            bool controls = (now - lastInput < 4000 || paused) && !locked;
             bool showFlash = !flash.empty() && now - flashAt < 900;
             // Informational messages stay up longer than the quick seek / delay feedback.
             uint32_t flashLife = (flash.rfind("Paused", 0) == 0 || flash.rfind("Subtitles:", 0) == 0 || flash.rfind("No ", 0) == 0) ? 3500 : 900;
@@ -871,19 +1050,23 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                     a.gradientV(0, 170, col::black, 190, 0);
                     a.gradientV(440, 280, col::black, 0, 215);
                     a.poly({60, 50, 72, 40, 72, 60}, col::white);  // back arrow
+                    a.pill(1130, 50, "-");
+                    a.lockIcon(1196, 52, 12, col::white);
                     a.text(86, 50, 30, col::white, 4, ctx.name);
                     if (!ctx.episodeLabel.empty()) a.text(86, 90, 21, col::dim, 4, ctx.episodeLabel);
 
                     // Progress bar: played (accent), buffered (light), rest (dim)
                     float bx = 60, bw = 1060, by = 616;
-                    float p = dur > 0 ? (float)std::min(1.0, pos / dur) : 0;
+                    double at = scrubbing ? dur * scrubFrac : pos;  // while dragging: where the finger is
+                    float p = dur > 0 ? (float)std::min(1.0, at / dur) : 0;
                     float b = dur > 0 ? (float)std::min(1.0, (pos + std::max(0.0, cacheAhead)) / dur) : 0;
                     a.roundRect(bx, by, bw, 6, 3, col::white.alpha(70));
                     a.roundRect(bx, by, bw * b, 6, 3, col::white.alpha(120));
                     a.roundRect(bx, by, std::max(6.0f, bw * p), 6, 3, col::accent);
-                    a.circle(bx + bw * p, by + 3, 9, col::white);
-                    a.text(1220, by + 3, 22, col::white, 6, dur > 0 ? "-" + clock(dur - pos) : clock(pos));
-                    a.text(bx, by - 30, 18, col::dim, 1, clock(pos) + (dur > 0 ? "  /  " + clock(dur) : ""));
+                    a.circle(bx + bw * p, by + 3, scrubbing ? 13 : 9, col::white);
+                    a.text(1220, by + 3, 22, col::white, 6, dur > 0 ? "-" + clock(dur - at) : clock(at));
+                    a.text(bx, by - 30, scrubbing ? 24 : 18, scrubbing ? col::white : col::dim, 1,
+                           clock(at) + (dur > 0 ? "  /  " + clock(dur) : ""));
                     if (speedIdx != 2) a.text(bx + 1060, by - 30, 18, col::accentLight, 3, optionLabel(0));
 
                     // Buttons row
@@ -903,6 +1086,14 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                     a.text(898, ry, 19, col::white, 4, "Audio, subtitles & more");
                     a.pill(1150, ry, "B");
                     a.text(1188, ry, 19, col::white, 4, "Back");
+                }
+                if (locked && now - lockHintAt < 3000) {
+                    // At the top: a second tap there can't hit the progress bar.
+                    a.roundRect(420, 30, 520, 64, 32, col::black.alpha(200));
+                    a.lockIcon(466, 64, 12, unlockArmed ? col::accentLight : col::white);
+                    a.text(498, 62, 21, col::white, 4,
+                           hintTouch ? (unlockArmed ? "Tap again to unlock" : "Locked  -  tap here twice to unlock")
+                                     : "Locked  -  press any button twice, quickly");
                 }
                 if (paused && !buffering) {
                     a.circle(640, 360, 46, col::black.alpha(140));
@@ -959,18 +1150,25 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         mpv_render_param rp[] = {
             {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
             {MPV_RENDER_PARAM_FLIP_Y, &flipY},
+            {MPV_RENDER_PARAM_DEPTH, &fbDepth},
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
+        disableGlDither();  // every frame: mpv owns the GL state while it renders
         mpv_render_context_render(rctx, rp);
+        if (pointing) drawPointerGl((float)ptrX, (float)ptrY, w, h);
         watchBeat(WatchMain, "player: swap");
         SDL_GL_SwapWindow(win);
         mpv_render_context_report_swap(rctx);
     }
 
-    // A size picked in the player becomes the new default.
+    app.in.dragKeys = true;
+    app.in.pointerEnabled = true;
+
+    // A size and a volume picked in the player become the new defaults.
     int newSize = (int)std::lround(subScale * 100);
-    if (newSize != app.cfg.subSize) {
+    if (newSize != app.cfg.subSize || volumes[volumeIdx] != app.cfg.volume) {
         app.cfg.subSize = newSize;
+        app.cfg.volume = volumes[volumeIdx];
         app.cfg.save();
     }
 

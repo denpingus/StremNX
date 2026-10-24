@@ -70,6 +70,8 @@ void playStream(App& app, const Stream& s, PlayContext ctx, bool resume, bool by
 
 std::unique_ptr<Screen> makeTorrentScreen(App& app, const Stream& s, const PlayContext& ctx, bool resume);
 std::unique_ptr<Screen> makeNextEpisodeScreen(const PlayContext& finished);
+std::unique_ptr<Screen> makeAddonsScreen();  // Settings > Manage addons
+std::unique_ptr<Screen> makeHomeSectionsScreen();  // Settings > Home sections
 
 // Touch: a "Back" pill at the top-left of sub-screens (tap id kHitBack).
 constexpr int kHitBack = 2;

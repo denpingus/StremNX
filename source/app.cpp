@@ -27,7 +27,6 @@ void Config::load() {
         return;
     }
     authKey = j["authKey"].str();
-    saveDownloads = j["saveDownloads"].boolean();
     uploadMode = (int)j["uploadMode"].num(1);
     if (j.has("subLang")) subLang = j["subLang"].str();
     subAddons = j["subAddons"].boolean(true);
@@ -37,29 +36,47 @@ void Config::load() {
     subColor = (int)j["subColor"].num(0);
     subDelayMs = (int)j["subDelayMs"].num(0);
     subStepMs = (int)j["subStepMs"].num(100);
+    volume = (int)j["volume"].num(100);
+    dither = j["dither"].boolean(false);
     prefQuality = j["prefQuality"].str("auto");
     lastQuality = j["lastQuality"].str();
     preferSource = (int)j["preferSource"].num(0);
     autoplayNext = j["autoplayNext"].boolean(true);
     resumeSavedStream = j["resumeSavedStream"].boolean(true);
+    autoDownload = j["autoDownload"].boolean(false);
     email = j["email"].str();
     server = j["server"].str();
     addons.clear();
     for (auto& a : j["addons"].items())
-        if (!a.str().empty()) addons.push_back(a.str());
+        if (!a.str().empty()) addons.push_back(normalizeAddonUrl(a.str()));  // fixes ones saved before
+    disabledAddons.clear();
+    for (auto& a : j["disabledAddons"].items())
+        if (!a.str().empty()) disabledAddons.push_back(a.str());
+    homeOrder.clear();
+    for (auto& a : j["homeOrder"].items()) homeOrder.push_back(a.str());
+    homeHidden.clear();
+    for (auto& a : j["homeHidden"].items()) homeHidden.push_back(a.str());
 }
 
 void Config::save() const {
     Json j = Json::object();
-    j.set("authKey", authKey).set("email", email).set("server", server).set("saveDownloads", saveDownloads);
+    j.set("authKey", authKey).set("email", email).set("server", server).set("autoDownload", autoDownload);
     j.set("uploadMode", uploadMode);
     j.set("subLang", subLang).set("subAddons", subAddons).set("subSize", subSize).set("subPos", subPos);
     j.set("subStyle", subStyle).set("subColor", subColor).set("subDelayMs", subDelayMs).set("subStepMs", subStepMs);
     j.set("prefQuality", prefQuality).set("lastQuality", lastQuality).set("preferSource", preferSource);
-    j.set("autoplayNext", autoplayNext).set("resumeSavedStream", resumeSavedStream);
+    j.set("autoplayNext", autoplayNext).set("resumeSavedStream", resumeSavedStream).set("volume", volume);
+    j.set("dither", dither);
     Json arr = Json::array();
     for (auto& a : addons) arr.push(a);
     j.set("addons", arr);
+    Json disabled = Json::array();
+    for (auto& a : disabledAddons) disabled.push(a);
+    j.set("disabledAddons", disabled);
+    Json order = Json::array(), off = Json::array();
+    for (auto& k : homeOrder) order.push(k);
+    for (auto& k : homeHidden) off.push(k);
+    j.set("homeOrder", order).set("homeHidden", off);
     std::string text = j.dump();
     if (!writeFile(kConfigPath, text.data(), text.size())) logMsg("failed to save config");
 }
@@ -99,6 +116,7 @@ bool App::init() {
         return false;
     }
     logMsg("init: SDL ok");
+    requestColorDepth();
     win = SDL_CreateWindow("StremNX", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_W, SCREEN_H,
                            SDL_WINDOW_OPENGL);
     if (!win) {
@@ -134,6 +152,14 @@ void App::dumpSystemFont() {
 }
 
 void App::shutdown() {
+    // Torrents first: their engines finish writing and close the SD card files, so a download resumes
+    // where it stopped.
+    std::vector<std::shared_ptr<Torrent>> torrents = downloads;
+    if (activeTorrent) torrents.push_back(activeTorrent);
+    if (warm) torrents.push_back(warm);
+    for (auto& t : torrents) t->stop();
+    for (auto& t : torrents) t->waitStopped(3000);
+
     stack.clear();
     toPush.clear();
     gfx.destroy();
@@ -141,7 +167,9 @@ void App::shutdown() {
     IMG_Quit();
     TTF_Quit();
     SDL_Quit();
-    httpCleanup();
+    // curl and the sockets are left alone: threads loading artwork or catalogs, or asking trackers, can
+    // still be in the middle of a request, and tearing those down under them crashed the app on exit
+    // ("An error has occurred"). The process exit releases them.
     logClose();
 }
 
@@ -175,6 +203,22 @@ void App::requestPlay(const std::string& url, const PlayContext& ctx, bool resum
 void App::keepDownloading(const std::shared_ptr<Torrent>& t) {
     if (std::find(downloads.begin(), downloads.end(), t) == downloads.end()) downloads.push_back(t);
     logMsg("downloads: %s keeps downloading in the background", t->infoHash().c_str());
+}
+
+void App::keepWarm(const std::shared_ptr<Torrent>& t) {
+    if (warm && warm != t) warm->stop();
+    warm = t && !t->stopped() ? t : nullptr;
+    if (!warm) return;
+    warm->yieldNetwork(true);
+    warmUntil = SDL_GetTicks() + 5 * 60 * 1000;
+}
+
+std::shared_ptr<Torrent> App::takeWarm(const std::string& infoHash, int fileIdx) {
+    if (!warm || warm->infoHash() != infoHash || warm->fileIndex() != fileIdx) return nullptr;
+    std::shared_ptr<Torrent> t = std::move(warm);
+    warm.reset();
+    t->yieldNetwork(false);
+    return t;
 }
 
 std::shared_ptr<Torrent> App::findDownload(const std::string& infoHash, int fileIdx) {
@@ -265,6 +309,17 @@ bool App::tapped(int& id, int& a, int& b) {
     return false;
 }
 
+// The network can be briefly unavailable or busy (Wi-Fi reconnecting after sleep, the console just
+// started): one failed request must not leave the app without the account's addons.
+template <class F>
+static bool withRetries(F attempt) {
+    for (int i = 0;; i++) {
+        if (attempt()) return true;
+        if (i == 2) return false;
+        svcSleepThread((i + 1) * 2000000000ULL);  // 2 s, then 4 s
+    }
+}
+
 void App::reloadAddons() {
     Config c = cfg;
     addonsTask.start([c]() {
@@ -272,9 +327,10 @@ void App::reloadAddons() {
         std::vector<AddonEntry> entries;
         if (!c.authKey.empty()) {
             std::string err;
-            if (!apiAddonCollection(c.authKey, entries, err)) res.errors.push_back("Account: " + err);
+            if (!withRetries([&] { return apiAddonCollection(c.authKey, entries, err); }))
+                res.errors.push_back("Account: " + err);
             std::string libErr;
-            if (apiDatastoreGet(c.authKey, res.accountItems, libErr)) {
+            if (withRetries([&] { return apiDatastoreGet(c.authKey, res.accountItems, libErr); })) {
                 res.accountOk = true;
                 res.library = progressFromLibrary(res.accountItems);
                 res.libraryItems = libraryFromItems(res.accountItems);
@@ -292,13 +348,15 @@ void App::reloadAddons() {
         for (auto& e : entries) {
             std::string url = normalizeAddonUrl(e.url);
             if (!seen.insert(url).second) continue;
+            if (std::find(c.disabledAddons.begin(), c.disabledAddons.end(), url) != c.disabledAddons.end()) continue;
             Addon a;
             std::string err;
-            if (addonFromManifest(url, e.manifest, a) || fetchManifest(url, a, err)) {
+            if (addonFromManifest(url, e.manifest, a) || withRetries([&] { return fetchManifest(url, a, err); })) {
                 logMsg("addon: %s (%s)", a.name.c_str(), url.c_str());
                 res.addons.push_back(a);
             } else {
                 res.errors.push_back(url + ": " + err);
+                res.failed[url] = err;
             }
         }
         return res;
@@ -330,6 +388,13 @@ void App::drawFooter(const std::string& hints) {
         gfx.text(it->first, x + kw / 2, SCREEN_H - 31, 16, col::text, 0, AlignCenter);
         x -= 28;
     }
+}
+
+void App::drawPointer() {
+    int x = 0, y = 0;
+    if (!in.pointer(x, y)) return;
+    gfx.circle((float)x, (float)y, 12, col::black.alpha(150));
+    gfx.circle((float)x, (float)y, 8, col::white);
 }
 
 void App::drawSpinner(int cx, int cy, int radius) {
@@ -371,6 +436,7 @@ void App::run() {
         if (addonsTask.ready()) {
             AddonsResult res = addonsTask.take();
             addons = std::move(res.addons);
+            addonErrors = std::move(res.failed);
             addonsVersion++;
             if (!res.library.empty()) {
                 history.mergeAccount(res.library);
@@ -384,6 +450,16 @@ void App::run() {
             }
             if (!res.errors.empty()) toast(std::to_string(res.errors.size()) + " addon(s) failed: " + res.errors[0]);
         }
+
+        // Background downloads step aside while the app fetches anything for the viewer (catalogs,
+        // details, episodes, artwork): browsing comes first. The torrent being watched never does.
+        bool browsing = httpForegroundBusy() || gfx.loadingImages();
+        for (auto& t : downloads) {
+            t->yieldNetwork(t != activeTorrent && browsing);
+            t->setWatched(t == activeTorrent);
+        }
+
+        if (warm && SDL_GetTicks() > warmUntil) keepWarm(nullptr);  // not reopened: free it
 
         // Finished or failed background downloads release their peers and memory.
         watchBeat(WatchMain, "main: downloads check");
@@ -413,8 +489,8 @@ void App::run() {
             PlayContext ctx = playCtx;
             playUrl.clear();
             double startAt = 0;
-            const HistoryEntry* h = history.findVideo(ctx.videoId);
-            if (playResume && h && h->position > 30 && !h->finished()) startAt = h->position;
+            const HistoryEntry* h = history.resumePoint(ctx);
+            if (playResume && h) startAt = h->position;
             logMsg("playing: %s (start %.0fs)", url.c_str(), startAt);
 
             watchBeat(WatchMain, "main: starting player");
@@ -458,6 +534,7 @@ void App::run() {
             gfx.roundRect(x, SCREEN_H - 120, w, 50, 25, col::cardSel.alpha(245));
             gfx.text(toastMsg, SCREEN_W / 2, SCREEN_H - 107, 21, col::text, SCREEN_W - 160, AlignCenter);
         }
+        drawPointer();
         watchBeat(WatchMain, "main: present");
         gfx.present();
         if (gfx.frameCount() == 1) logMsg("run: first frame drawn");

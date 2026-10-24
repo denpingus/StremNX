@@ -21,7 +21,10 @@ struct Config {
     std::string authKey, email;
     std::string server;               // stremio-server for torrents, e.g. http://192.168.0.10:11470
     std::vector<std::string> addons;  // extra addons added by URL
-    bool saveDownloads = false;       // save torrents to the SD card while they play
+    std::vector<std::string> disabledAddons;  // addons switched off on this Switch (any kind)
+    // Home sections (catalog keys "addonId/type/catalogId"): the order picked and the ones switched off.
+    std::vector<std::string> homeOrder, homeHidden;
+    bool autoDownload = false;        // save every torrent played to the SD card (off: only by hand)
     int uploadMode = 1;               // torrent uploading: 0 off, 1 limited, 2 normal
     // Subtitles
     std::string subLang = "pob";  // SubLanguage code, "" = off
@@ -38,6 +41,10 @@ struct Config {
     int preferSource = 0;              // 0 any, 1 debrid/direct links, 2 torrents
     bool autoplayNext = true;          // play the next episode at the end
     bool resumeSavedStream = true;     // Continue watching reuses the stream picked before
+    int volume = 100;                  // player volume in percent (the last one picked in the player)
+    // mpv dithering: off by default. Its noise pattern is fixed on screen, per color channel, and on the
+    // OLED panel it shows as a still film of red and green specks over dark scenes.
+    bool dither = false;
     void load();
     void save() const;
 };
@@ -56,6 +63,7 @@ std::unique_ptr<Screen> makeHomeScreen();
 struct AddonsResult {
     std::vector<Addon> addons;
     std::vector<std::string> errors;
+    std::map<std::string, std::string> failed;  // addon URL -> why it did not load
     std::vector<HistoryEntry> library;  // account progress, when logged in
     bool accountOk = false;             // datastore read worked
     Json accountItems;                  // raw account library items
@@ -86,6 +94,10 @@ public:
     // Background SD card downloads (torrents that keep running after leaving the player).
     void keepDownloading(const std::shared_ptr<Torrent>& t);
     std::shared_ptr<Torrent> findDownload(const std::string& infoHash, int fileIdx);
+    // The last streamed torrent stays alive a few minutes after leaving it (RAM cache and peers kept,
+    // nothing new downloaded): opening the same stream again starts at once. nullptr drops it.
+    void keepWarm(const std::shared_ptr<Torrent>& t);
+    std::shared_ptr<Torrent> takeWarm(const std::string& infoHash, int fileIdx);
     void stopDownload(const std::string& infoHash, int fileIdx);
     std::vector<std::shared_ptr<Torrent>> downloads;
 
@@ -115,6 +127,8 @@ public:
 
     std::vector<Addon> addons;
     int addonsVersion = 0;   // bumped whenever the addon list changes
+    int homeVersion = 0;     // bumped when the home sections are edited
+    std::map<std::string, std::string> addonErrors;  // addon URL -> why it did not load (last reload)
     int historyVersion = 0;  // bumped whenever the watch history changes
     bool addonsLoading() const { return addonsTask.active(); }
 
@@ -122,6 +136,7 @@ public:
     void drawFooter(const std::string& hints);
     void drawLoading(int x, int y, const std::string& label, Align align = AlignCenter);
     void drawSpinner(int cx, int cy, int radius);
+    void drawPointer();  // the gyro pointer, when it is showing
 
 private:
     void applyPending();
@@ -137,6 +152,8 @@ private:
     PlayContext playCtx;
     bool playResume = true;
     Task<AddonsResult> addonsTask;
+    std::shared_ptr<Torrent> warm;
+    uint32_t warmUntil = 0;
 };
 
 // startAt: seconds to resume from (0 = beginning).
