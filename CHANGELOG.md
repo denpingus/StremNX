@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 (2026-11-16)
+
+- Fix: debrid streams (Torrentio + Real-Debrid and other `https://` links) failed with "Playback error: loading
+  failed". The player's FFmpeg has no HTTPS support, so remote streams are now read through libcurl, with seeking
+  and automatic reconnection when the link drops
+
 ## 0.3.1 (2026-10-19)
 
 - Fix: subtitles from addons often did not show up. OpenSubtitles v3 (the official Stremio subtitles addon) is now
