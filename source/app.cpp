@@ -42,6 +42,7 @@ void Config::load() {
     preferSource = (int)j["preferSource"].num(0);
     autoplayNext = j["autoplayNext"].boolean(true);
     resumeSavedStream = j["resumeSavedStream"].boolean(true);
+    checkUpdates = j["checkUpdates"].boolean(true);
     email = j["email"].str();
     server = j["server"].str();
     addons.clear();
@@ -56,7 +57,7 @@ void Config::save() const {
     j.set("subLang", subLang).set("subAddons", subAddons).set("subSize", subSize).set("subPos", subPos);
     j.set("subStyle", subStyle).set("subColor", subColor).set("subDelayMs", subDelayMs).set("subStepMs", subStepMs);
     j.set("prefQuality", prefQuality).set("lastQuality", lastQuality).set("preferSource", preferSource);
-    j.set("autoplayNext", autoplayNext).set("resumeSavedStream", resumeSavedStream);
+    j.set("autoplayNext", autoplayNext).set("resumeSavedStream", resumeSavedStream).set("checkUpdates", checkUpdates);
     Json arr = Json::array();
     for (auto& a : addons) arr.push(a);
     j.set("addons", arr);
@@ -121,7 +122,8 @@ bool App::init() {
     push(makeHomeScreen());
     applyPending();
     reloadAddons();
-    logMsg("init: done");
+    if (cfg.checkUpdates) checkForUpdates(false);
+    logMsg("init: done (version " APP_VERSION ")");
     return true;
 }
 
@@ -305,6 +307,135 @@ void App::reloadAddons() {
     });
 }
 
+// ---------------------------------------------------------------- updates
+
+void App::checkForUpdates(bool manual) {
+    if (updateTask.active()) return;
+    updateManual = manual;
+    updateTask.start([]() { return checkForUpdate(); });
+}
+
+void App::installUpdate() {
+    if (!update.available || (updateDl && !updateDl->finished)) return;
+    updateDl = startUpdateDownload(update);
+    updateDlReported = false;
+}
+
+void App::restartAfterUpdate() {
+    std::string nro = updateDl ? updateDl->path : updaterSelfPath();
+    if (!updaterRelaunch(nro)) logMsg("update: cannot relaunch, the viewer has to reopen the app");
+    quit();
+}
+
+// Release notes are Markdown: drop the heading marks and keep the first lines.
+static std::string plainNotes(const std::string& md) {
+    std::string out;
+    size_t start = 0;
+    int lines = 0;
+    while (start < md.size() && lines < 7) {
+        size_t end = md.find('\n', start);
+        std::string line = md.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        start = end == std::string::npos ? md.size() : end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t i = 0;
+        while (i < line.size() && (line[i] == '#' || line[i] == ' ')) i++;
+        line = line.substr(i);
+        std::string clean;
+        for (char c : line)
+            if (c != '*' && c != '`') clean += c;
+        if (clean.empty()) continue;
+        if (clean[0] == '-') clean = "\xE2\x80\xA2" + clean.substr(1);
+        out += (out.empty() ? "" : "\n") + clean;
+        lines++;
+    }
+    return out;
+}
+
+void App::updateUpdatePopup() {
+    bool installing = updateDl && !updateDl->finished;
+    bool installed = updateDl && updateDl->finished && updateDl->ok;
+    int buttons = installing ? 0 : 2;
+    if (in.pressed(K_LEFT) && popupBtn > 0) popupBtn--;
+    if (in.pressed(K_RIGHT) && popupBtn + 1 < buttons) popupBtn++;
+    int id = 0, a = 0, b = 0;
+    bool press = in.pressed(K_A);
+    if (tapped(id, a, b) && id == 900) {
+        popupBtn = a;
+        press = true;
+    }
+    if (in.pressed(K_B) || in.pressed(K_PLUS)) {
+        updatePopup = false;  // a running download keeps going; Settings shows its progress
+        return;
+    }
+    if (!press || buttons == 0) return;
+    if (popupBtn == 1) {
+        updatePopup = false;
+    } else if (installed) {
+        restartAfterUpdate();
+    } else {
+        installUpdate();  // first try or "Try again"
+    }
+}
+
+void App::drawUpdatePopup() {
+    const int w = 680, h = 380, x = (SCREEN_W - w) / 2, y = (SCREEN_H - h) / 2;
+    gfx.rect(0, 0, SCREEN_W, SCREEN_H, col::shade);
+    gfx.roundRect(x, y, w, h, 20, col::card);
+    gfx.roundOutline(x, y, w, h, 20, 1, col::accent.alpha(140));
+    if (SDL_Texture* logo = gfx.image("romfs:/logo.png")) gfx.drawTex(logo, x + 32, y + 30, 56, 56);
+
+    std::string title, sub, body, b0, b1 = "Later";
+    Color subColor = col::dim;
+    bool installing = updateDl && !updateDl->finished;
+    if (!updateDl) {
+        title = "New version available";
+        sub = "StremNX " + update.version + "  \xC2\xB7  you have " APP_VERSION;
+        body = plainNotes(update.notes);
+        b0 = "Update now";
+    } else if (installing) {
+        title = "Updating...";
+        sub = "Downloading StremNX " + update.version;
+        body = "You can keep using the app. B hides this window.";
+    } else if (updateDl->ok) {
+        title = "Update installed";
+        sub = "StremNX " + update.version + " is ready";
+        subColor = col::success;
+        bool loader = envHasNextLoad();
+        body = loader ? "Restart to start using the new version."
+                      : "Close StremNX and open it again to start using the new version.";
+        b0 = loader ? "Restart now" : "Close StremNX";
+    } else {
+        title = "Update failed";
+        sub = updateDl->error;
+        subColor = col::error;
+        body = "Nothing was changed. Check the connection and try again.";
+        b0 = "Try again";
+        b1 = "Close";
+    }
+    gfx.text(title, x + 108, y + 30, 30, col::text, w - 140);
+    gfx.text(sub, x + 108, y + 68, 19, subColor, w - 140);
+    gfx.textWrapped(body, x + 36, y + 114, 18, col::dim, w - 72, installing ? 60 : 160);
+
+    if (installing) {
+        int64_t done = updateDl->done, total = updateDl->total;
+        float p = total > 0 ? std::min(1.0f, (float)done / (float)total) : 0;
+        int bx = x + 36, bw = w - 72, by = y + 220;
+        gfx.roundRect(bx, by, bw, 10, 5, col::white.alpha(40));
+        gfx.roundRect(bx, by, std::max(10, (int)(bw * p)), 10, 5, col::accent);
+        char line[64];
+        snprintf(line, sizeof(line), "%.1f / %.1f MB", done / 1048576.0, total / 1048576.0);
+        gfx.text(line, bx, by + 24, 18, col::faint);
+        gfx.text(std::to_string((int)(p * 100)) + "%", bx + bw, by + 24, 18, col::text, 0, AlignRight);
+        return;
+    }
+    int bw0 = buttonWidth(gfx, b0, IconNone), bw1 = buttonWidth(gfx, b1, IconNone);
+    int by = y + h - 80;
+    drawButton(gfx, x + 36, by, bw0, 50, b0, popupBtn == 0, popupBtn == 0, IconNone);
+    drawButton(gfx, x + 54 + bw0, by, bw1, 50, b1, popupBtn == 1, false, IconNone);
+    hit(x + 36, by, bw0, 50, 900, 0);
+    hit(x + 54 + bw0, by, bw1, 50, 900, 1);
+}
+
 // Hints are "KEY Label" pairs separated by three spaces, e.g. "A Open   B Back".
 void App::drawFooter(const std::string& hints) {
     gfx.gradientV(0, SCREEN_H - 90, SCREEN_W, 90, col::bg, 0, 235);
@@ -385,6 +516,20 @@ void App::run() {
             if (!res.errors.empty()) toast(std::to_string(res.errors.size()) + " addon(s) failed: " + res.errors[0]);
         }
 
+        watchBeat(WatchMain, "main: updates");
+        if (updateTask.ready()) {
+            update = updateTask.take();
+            if (update.available) {
+                showUpdatePopup();
+            } else if (updateManual) {
+                toast(update.ok ? "StremNX is up to date (" APP_VERSION ")" : "Could not check for updates: " + update.error);
+            }
+        }
+        if (updateDl && updateDl->finished && !updateDlReported) {
+            updateDlReported = true;
+            showUpdatePopup();  // installed (restart?) or failed (try again?)
+        }
+
         // Finished or failed background downloads release their peers and memory.
         watchBeat(WatchMain, "main: downloads check");
         if (SDL_GetTicks() - lastDownloadCheck > 1000) {
@@ -403,7 +548,8 @@ void App::run() {
         }
 
         watchBeat(WatchMain, "main: screen update");
-        if (!stack.empty()) stack.back()->update(*this);
+        if (updatePopup) updateUpdatePopup();  // the window takes the input while it is up
+        else if (!stack.empty()) stack.back()->update(*this);
         applyPending();
         if (stack.empty()) running = false;
         if (!running) break;
@@ -452,6 +598,7 @@ void App::run() {
         hits.clear();  // rebuilt while drawing; taps next frame are matched against them
         gfx.clear(col::bg);
         stack.back()->draw(*this);
+        if (updatePopup) drawUpdatePopup();
         if (!toastMsg.empty() && SDL_GetTicks() < toastUntil) {
             int w = std::min(gfx.textWidth(toastMsg, 21), SCREEN_W - 160) + 48;
             int x = (SCREEN_W - w) / 2;

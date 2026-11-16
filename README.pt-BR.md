@@ -88,6 +88,9 @@ O resultado é o arquivo `stremnx.nro`.
 
 Copie `stremnx.nro` para `sdmc:/switch/stremnx/` e abra pelo Homebrew Menu.
 
+Versões novas aparecem dentro do app e são instaladas por lá (**Settings > Updates**); não precisa copiar o `.nro`
+de novo.
+
 **Importante:** abra o Homebrew Menu segurando **R** ao abrir um jogo (modo título, não pelo Álbum). No modo applet, o app tem pouca memória e o vídeo não roda.
 
 Para testar mais rápido, sem tirar o cartão SD: no Homebrew Menu aperte **Y** (nxlink) e, no PC, rode:

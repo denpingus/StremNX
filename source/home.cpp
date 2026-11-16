@@ -912,7 +912,24 @@ public:
         S_PREF_QUALITY, S_PREF_SOURCE, S_AUTOPLAY, S_RESUME_STREAM,
         S_SUB_LANG, S_SUB_ADDONS, S_SUB_SIZE, S_SUB_POS, S_SUB_STYLE, S_SUB_COLOR, S_SUB_DELAY, S_SUB_STEP,
         S_ADD_ADDON, S_REMOVE_ADDONS, S_RELOAD, S_CLEAR_HISTORY,
+        S_UPDATE, S_CHECK_UPDATES,
     };
+
+    static std::string updateRowLabel(App& app, std::string& value) {
+        value = "Version " APP_VERSION;
+        if (app.updateDl && !app.updateDl->finished) {
+            int64_t t = app.updateDl->total;
+            value = t > 0 ? std::to_string((int)(app.updateDl->done * 100 / t)) + "%" : "";
+            return "Downloading StremNX " + app.update.version;
+        }
+        if (app.updateDl && app.updateDl->ok) return "Restart to finish the update";
+        if (app.updateChecking()) return "Checking for updates...";
+        if (app.update.available) {
+            value = "New";
+            return "Install StremNX " + app.update.version;
+        }
+        return "Check for updates";
+    }
     enum SettingKind { Action, Toggle, Choice };
     struct SettingRow {
         SettingId id;
@@ -931,6 +948,7 @@ public:
         const Config& c = app.cfg;
         static const char* positions[] = {"Bottom", "Slightly higher", "Higher", "Much higher"};
         int posIdx = std::max(0, std::min(3, (100 - c.subPos) / 5));
+        std::string updValue, updLabel = updateRowLabel(app, updValue);
         return {
             {S_ACCOUNT, Action, c.authKey.empty() ? "Log in with a Stremio account" : "Log out", c.email, "Account"},
             {S_SAVE_SD, Toggle, "Save torrents to SD card", "", "Torrents", c.saveDownloads},
@@ -956,6 +974,8 @@ public:
             {S_REMOVE_ADDONS, Action, "Remove addons added by URL", std::to_string(c.addons.size()), ""},
             {S_RELOAD, Action, "Reload addons and library", "", ""},
             {S_CLEAR_HISTORY, Action, "Clear watch history", "", ""},
+            {S_UPDATE, Action, updLabel, updValue, "Updates"},
+            {S_CHECK_UPDATES, Toggle, "Check for updates at startup", "", "", c.checkUpdates},
         };
     }
 
@@ -1032,6 +1052,7 @@ public:
             if (row.id == S_SUB_ADDONS) app.cfg.subAddons = on;
             if (row.id == S_AUTOPLAY) app.cfg.autoplayNext = on;
             if (row.id == S_RESUME_STREAM) app.cfg.resumeSavedStream = on;
+            if (row.id == S_CHECK_UPDATES) app.cfg.checkUpdates = on;
             app.cfg.save();
         }
         if (!in.pressed(K_A) && !tapPress) return;
@@ -1101,6 +1122,14 @@ public:
                 app.reloadAddons();
                 break;
             case S_RELOAD: app.reloadAddons(); break;
+            case S_UPDATE:
+                if (app.updateDl || app.update.available) app.showUpdatePopup();
+                else app.checkForUpdates(true);
+                break;
+            case S_CHECK_UPDATES:
+                c.checkUpdates = !c.checkUpdates;
+                c.save();
+                break;
             case S_CLEAR_HISTORY:
                 app.history = History();
                 app.history.save();
@@ -1394,6 +1423,7 @@ public:
             int w = g.text(names[i], x, 24, 21, s ? col::text : col::dim);
             if (s) selX = (float)x, selW = (float)w;
             if (i == TAB_DOWNLOADS && !app.downloads.empty()) g.circle(x + w + 7, 28, 4, col::success);  // active
+            if (i == TAB_SETTINGS && app.update.available) g.circle(x + w + 7, 28, 4, col::gold);  // new version
             app.hit(x - 12, 12, w + 24, 48, 1, i);
             x += w + 28;
         }

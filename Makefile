@@ -28,7 +28,7 @@ PKGS     := mpv SDL2_ttf SDL2_image sdl2 libcurl
 #---------------------------------------------------------------------------------
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ \
+CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DAPP_VERSION=\"$(APP_VERSION)\" \
             $(INCLUDE) $(shell $(PKGCONF) --cflags $(PKGS))
 CXXFLAGS := $(CFLAGS) -std=gnu++17
 ASFLAGS  := -g $(ARCH)

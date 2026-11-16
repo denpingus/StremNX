@@ -5,6 +5,9 @@
 - Fix: debrid streams (Torrentio + Real-Debrid and other `https://` links) failed with "Playback error: loading
   failed". The player's FFmpeg has no HTTPS support, so remote streams are now read through libcurl, with seeking
   and automatic reconnection when the link drops
+- **In-app updates**: StremNX checks GitHub for a new version at startup and shows a window to install it. The new
+  `.nro` is downloaded, checked and put in place of the old one, then the app restarts into it. Also in
+  **Settings > Updates** (check by hand, or turn off the check at startup)
 
 ## 0.3.1 (2026-10-19)
 

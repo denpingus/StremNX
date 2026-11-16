@@ -45,6 +45,9 @@
 2. Copy it to `sdmc:/switch/stremnx/stremnx.nro` on your SD card.
 3. Open it from the Homebrew Menu (title mode).
 
+New versions are announced inside the app and installed from there (**Settings > Updates**); there is no need to
+copy the `.nro` again.
+
 Without logging in, only the official Cinemeta catalog is available. Log in under **Settings** to use the addons
 installed on your Stremio account, or add an addon by its manifest URL.
 

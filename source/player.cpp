@@ -408,7 +408,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     setOpt(mpv, "demuxer-max-bytes", "48MiB");
     setOpt(mpv, "demuxer-max-back-bytes", "8MiB");
     setOpt(mpv, "network-timeout", "30");
-    setOpt(mpv, "user-agent", "StremNX/0.3.2");
+    setOpt(mpv, "user-agent", "StremNX/" APP_VERSION);
     setOpt(mpv, "keep-open", "no");
     setOpt(mpv, "volume-max", "200");
     setOpt(mpv, "osd-level", "1");
@@ -456,7 +456,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
     const bool isTorrent = url.compare(0, 10, "torrent://") == 0 && app.activeTorrent;
     if (isTorrent) mpv_stream_cb_add_ro(mpv, "torrent", &app.activeTorrent, torrentOpen);
-    static const char* userAgent = "StremNX/0.3.2 (Nintendo Switch)";
+    static const char* userAgent = "StremNX/" APP_VERSION " (Nintendo Switch)";
     int prc = mpv_stream_cb_add_ro(mpv, HTTPSTREAM_PROTO, const_cast<char*>(userAgent), httpStreamOpen);
     if (prc < 0) logMsg("mpv: cannot register %s:// (%s)", HTTPSTREAM_PROTO, mpv_error_string(prc));
 

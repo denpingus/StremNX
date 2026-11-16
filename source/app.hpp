@@ -12,6 +12,7 @@
 #include "task.hpp"
 #include "torrent.hpp"
 #include "ui.hpp"
+#include "updater.hpp"
 
 constexpr int SCREEN_W = 1280;
 constexpr int SCREEN_H = 720;
@@ -38,6 +39,7 @@ struct Config {
     int preferSource = 0;              // 0 any, 1 debrid/direct links, 2 torrents
     bool autoplayNext = true;          // play the next episode at the end
     bool resumeSavedStream = true;     // Continue watching reuses the stream picked before
+    bool checkUpdates = true;          // look for a new version on GitHub at startup
     void load();
     void save() const;
 };
@@ -118,6 +120,15 @@ public:
     int historyVersion = 0;  // bumped whenever the watch history changes
     bool addonsLoading() const { return addonsTask.active(); }
 
+    // Updates (GitHub releases)
+    void checkForUpdates(bool manual);  // manual: say so when there is nothing new
+    void installUpdate();
+    void restartAfterUpdate();
+    bool updateChecking() const { return updateTask.active(); }
+    UpdateInfo update;                         // last check result
+    std::shared_ptr<UpdateDownload> updateDl;  // set while / after installing
+    void showUpdatePopup() { updatePopup = true, popupBtn = 0; }
+
     // Footer with button hints.
     void drawFooter(const std::string& hints);
     void drawLoading(int x, int y, const std::string& label, Align align = AlignCenter);
@@ -137,6 +148,12 @@ private:
     PlayContext playCtx;
     bool playResume = true;
     Task<AddonsResult> addonsTask;
+    Task<UpdateInfo> updateTask;
+    bool updateManual = false, updateDlReported = false;
+    bool updatePopup = false;  // the "new version" window over every screen
+    int popupBtn = 0;
+    void updateUpdatePopup();
+    void drawUpdatePopup();
 };
 
 // startAt: seconds to resume from (0 = beginning).

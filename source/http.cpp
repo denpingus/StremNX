@@ -34,7 +34,7 @@ static bool perform(const std::string& url, const std::string* body, std::string
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, timeoutSec);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "StremNX/0.1 (Nintendo Switch)");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "StremNX/" APP_VERSION " (Nintendo Switch)");
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, writeCb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
